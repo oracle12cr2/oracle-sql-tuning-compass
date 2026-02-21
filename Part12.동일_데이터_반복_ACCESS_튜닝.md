@@ -1,3 +1,526 @@
 # Part 12. 동일 데이터 반복 ACCESS 튜닝
 
-> 🔜 정리 중
+## Section 01. 서브쿼리 OR 인라인 뷰를 통한 반복 ACCESS - 분석 함수 활용
+
+### 첫 번째: MAX를 구하기 위한 서브쿼리 반복 ACCESS
+
+**ORDERS 테이블 현황**
+
+| 항목 | 내용 |
+|------|------|
+| 데이터 범위 | 20070101 ~ 20121231 |
+| 총 건수 | 3,000,000건 |
+| 총 BLOCK 수 | 19,791 BLOCK |
+| INDEX | IX_ORDERS_N1 - ORDER_DATE |
+
+#### 튜닝 전
+
+```sql
+SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, EMPLOYEE_ID
+     , ORDER_MODE, ORDER_STATUS, ORDER_TOTAL
+  FROM ORDERS
+ WHERE ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND ORDER_DATE <  TO_DATE('20130101', 'YYYYMMDD')
+   AND (CUSTOMER_ID, ORDER_DATE) IN (
+        SELECT CUSTOMER_ID, MAX(ORDER_DATE) ORDER_DATE
+          FROM ORDERS A
+         WHERE ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+           AND ORDER_DATE <  TO_DATE('20130101', 'YYYYMMDD')
+         GROUP BY CUSTOMER_ID);
+```
+
+ORDER_DATE 구간에서 CUSTOMER_ID별 마지막 주문 일자(ORDER_DATE)를 구하기 위해서 ORDERS 테이블을 **메인쿼리에서 읽고 서브쿼리에서 반복**.
+
+#### 튜닝 후 - RANK() 분석 함수 활용
+
+```sql
+SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, EMPLOYEE_ID
+     , ORDER_MODE, ORDER_STATUS, ORDER_TOTAL
+  FROM (
+        SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, EMPLOYEE_ID
+             , ORDER_MODE, ORDER_STATUS, ORDER_TOTAL
+             , RANK() OVER(PARTITION BY CUSTOMER_ID
+                           ORDER BY ORDER_DATE DESC) RNK
+          FROM ORDERS A
+         WHERE ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+           AND ORDER_DATE <  TO_DATE('20130101', 'YYYYMMDD')
+       )
+ WHERE RNK = 1;
+```
+
+RANK() 분석 함수를 이용해서 CUSTOMER_ID별로 ORDER_DATE가 가장 큰 순서로 RANKING을 구하고, `RNK = 1` 조건으로 가장 큰 ORDER_DATE만 필터링. **동일 집합 반복 SCAN 제거.**
+
+> **Buffers: 171K → 19,620으로 개선**
+> 단, SORT 부하는 발생. SORT되는 건수가 많아서 반복 ACCESS JOIN보다 SORT 부하로 인한 성능이 더 안 좋은 경우에는 기존대로 사용하는 것이 유리.
+
+#### RANK 분석 함수 종류
+
+| 함수 | 설명 |
+|------|------|
+| **RANK** | 1등이 2명일 때 다음은 3등 |
+| **DENSE_RANK** | 1등이 2명일 때 다음은 2등 (건너뛰는 번호 없음) |
+| **ROW_NUMBER** | 같은 점수라도 1등은 단 한 명 (일련번호 생성) |
+
+---
+
+### 두 번째: SUM 값을 위한 인라인 뷰 반복 ACCESS
+
+#### 튜닝 전
+
+```sql
+SELECT TO_CHAR(A.ORDER_DATE, 'YYYYMMDD') ORDER_DATE
+     , A.EMPLOYEE_ID
+     , SUM(A.ORDER_TOTAL) ORDER_TOTAL
+     , MAX(B.ORDER_TOTAL) MM_ORDER_TOTAL
+  FROM ORDERS A
+     , (SELECT TO_CHAR(ORDER_DATE, 'YYYYMM') ORDER_MM
+             , EMPLOYEE_ID
+             , SUM(ORDER_TOTAL) ORDER_TOTAL
+          FROM ORDERS
+         WHERE ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+           AND ORDER_DATE <  TO_DATE('20130101', 'YYYYMMDD')
+         GROUP BY TO_CHAR(ORDER_DATE, 'YYYYMM')
+                , EMPLOYEE_ID) B  -- 월 집계
+ WHERE TO_CHAR(A.ORDER_DATE, 'YYYYMM') = B.ORDER_MM
+   AND A.EMPLOYEE_ID = B.EMPLOYEE_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20130101', 'YYYYMMDD')
+ GROUP BY TO_CHAR(ORDER_DATE, 'YYYYMMDD')
+        , A.EMPLOYEE_ID;  -- 일 집계
+```
+
+EMPLOYEE_ID(사원)별로 일 단위 주문 금액 집계를 하면서 월 주문 금액을 같이 보여주기 위해, 인라인 뷰로 같은 테이블 같은 구간을 **한 번 더 ACCESS**.
+
+#### 튜닝 후 - SUM() OVER 분석 함수 활용
+
+```sql
+SELECT TO_CHAR(A.ORDER_DATE, 'YYYYMMDD') ORDER_DATE
+     , A.EMPLOYEE_ID
+     , SUM(A.ORDER_TOTAL) ORDER_TOTAL
+     , SUM(SUM(A.ORDER_TOTAL)) OVER(PARTITION BY TO_CHAR(ORDER_DATE, 'YYYYMM')
+                                                , EMPLOYEE_ID) MM_ORDER_TOTAL
+  FROM ORDERS A
+ WHERE A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20130101', 'YYYYMMDD')
+ GROUP BY TO_CHAR(ORDER_DATE, 'YYYYMMDD')
+        , A.EMPLOYEE_ID
+        , TO_CHAR(ORDER_DATE, 'YYYYMM');
+```
+
+> **Buffers: 39,240 → 19,620으로 개선. PGA 사용량까지 개선.**
+> 중복 ACCESS는 제거되었지만 WINDOW BUFFER로 인한 부하는 발생. 중복 ACCESS 제거보다 WINDOW BUFFER 처리 건수가 많아서 성능 부하가 높아진다면 기존대로 사용하는 것이 유리.
+
+`PARTITION BY` 절에 들어가야 되는 구문은 `GROUP BY` 절에 있어야 되기 때문에 `TO_CHAR(ORDER_DATE, 'YYYYMM')`를 GROUP BY에 기술. 하지만 집계 레벨은 일 단위이기 때문에 결과 집합에는 영향 없음.
+
+---
+
+## Section 02. UNION ALL 반복 ACCESS - SQL 통합
+
+동일한 테이블 같은 데이터 구간을 ACCESS하는 같은 SQL. 특정 조건에 따라서 UNION ALL로 분리해서 반복 ACCESS하는 경우.
+
+#### 튜닝 전
+
+```sql
+SELECT A.CUSTOMER_ID, A.EMPLOYEE_ID, B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY) ORDER_AMT
+  FROM ORDERS A, ORDER_ITEMS B, PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+   AND C.WEIGHT_CLASS = 1
+ GROUP BY A.CUSTOMER_ID, A.EMPLOYEE_ID, B.PRODUCT_ID
+UNION ALL
+SELECT A.CUSTOMER_ID, A.EMPLOYEE_ID, B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY * 1.1) ORDER_AMT
+  FROM ORDERS A, ORDER_ITEMS B, PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+   AND C.WEIGHT_CLASS <> 1
+ GROUP BY A.CUSTOMER_ID, A.EMPLOYEE_ID, B.PRODUCT_ID;
+```
+
+`C.WEIGHT_CLASS` 조건에 따라서 `UNIT_PRICE * QUANTITY`의 계산식이 달라지는 경우를 UNION ALL로 분리. 동일한 실행 계획 및 실행 통계가 UNION ALL로 묶여 있음. **실무에서 가끔 등장하는 비효율 사례 중 하나.**
+
+#### 튜닝 후 - DECODE/CASE WHEN 활용
+
+```sql
+SELECT A.CUSTOMER_ID, A.EMPLOYEE_ID
+     , B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY
+           * DECODE(C.WEIGHT_CLASS, 1, 1.1, 1)) ORDER_AMT
+  FROM ORDERS A
+     , ORDER_ITEMS B
+     , PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+ GROUP BY A.CUSTOMER_ID, A.EMPLOYEE_ID
+        , B.PRODUCT_ID;
+```
+
+DECODE 문을 이용해서 `C.WEIGHT_CLASS`가 1일 경우는 1.1을 곱해 주고 그 이외에는 1을 곱하도록 SQL을 **하나로 통합**.
+
+> **같은 테이블을 한 번만 ACCESS. Buffers와 Used-Mem이 두 배 가량 개선.**
+
+---
+
+## Section 03. UNION ALL 반복 ACCESS - 카테시안 JOIN
+
+### 카테시안 JOIN 개요
+
+```sql
+SELECT DEPARTMENT_ID, DEPARTMENT_NAME, MANAGER_ID, LOCATION_ID
+  FROM DEPARTMENTS
+ WHERE LOCATION_ID IN ('L01', 'L04');
+```
+
+위 결과 데이터를 각각 2배로 늘리기 위해서 건수가 2건인 집합과 **JOIN 조건 없이 사용** (= 카테시안 JOIN 또는 카테시안 곱). 결과 데이터의 건수는 `선행 테이블 건수 × 후행 테이블 건수`.
+
+```sql
+SELECT RCNT, DEPARTMENT_ID, DEPARTMENT_NAME, MANAGER_ID, LOCATION_ID
+  FROM DEPARTMENTS
+     , (SELECT LEVEL AS RCNT FROM DUAL CONNECT BY LEVEL <= 2)
+ WHERE LOCATION_ID IN ('L01', 'L04');
+```
+
+#### 선택적 카테시안 JOIN
+
+`LOCATION_ID`가 'L01'인 경우만 데이터 건수를 2배로 늘리려면:
+
+```sql
+SELECT RCNT, DEPARTMENT_ID, DEPARTMENT_NAME, MANAGER_ID, LOCATION_ID
+  FROM DEPARTMENTS
+     , (SELECT LEVEL AS RCNT FROM DUAL CONNECT BY LEVEL <= 2)
+ WHERE LOCATION_ID IN ('L01', 'L04')
+   AND RCNT <= CASE WHEN LOCATION_ID = 'L01' THEN 2 ELSE 1 END;
+```
+
+`RCNT <= CASE WHEN ... END` 부분이 LOCATION_ID가 L01인 경우만 2배로, 그 외는 그대로 유지.
+
+### 예제: ORDER_MODE별 집계를 한 번의 ACCESS로
+
+**INDEX 현황**
+- ORDERS: IX_ORDERS_N1 - ORDER_DATE
+- ORDER_ITEMS: IX_ORDER_ITEMS_N1 - ORDER_DATE
+
+#### 튜닝 전
+
+```sql
+SELECT TO_CHAR(A.ORDER_DATE, 'YYYYMMDD') ORDER_DAY
+     , 'AAA' ORDER_TYPE, B.PRODUCT_ID
+     , SUM(QUANTITY) QUANTITY
+  FROM ORDERS A, ORDER_ITEMS B
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+   AND A.ORDER_MODE IN ('online', 'direct')
+   AND B.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND B.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+ GROUP BY TO_CHAR(A.ORDER_DATE, 'YYYYMMDD'), B.PRODUCT_ID
+UNION ALL
+SELECT TO_CHAR(A.ORDER_DATE, 'YYYYMMDD') ORDER_DAY
+     , 'BBB' ORDER_TYPE, B.PRODUCT_ID
+     , SUM(QUANTITY) QUANTITY
+  FROM ORDERS A, ORDER_ITEMS B
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+   AND A.ORDER_MODE IN ('online')
+   AND B.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND B.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+ GROUP BY TO_CHAR(A.ORDER_DATE, 'YYYYMMDD'), B.PRODUCT_ID;
+```
+
+ORDER_MODE가 `('online', 'direct')`인 경우 → AAA, `'online'`만인 경우 → BBB로 집계. `'online'`이 두 번 집계되어야 하기 때문에 UNION ALL 사용.
+
+#### 튜닝 후 - 선택적 카테시안 JOIN 활용
+
+```sql
+SELECT TO_CHAR(A.ORDER_DATE, 'YYYYMMDD') ORDER_DAY
+     , CASE WHEN RCNT = 2 THEN 'BBB' ELSE 'AAA' END ORDER_TYPE
+     , B.PRODUCT_ID
+     , SUM(QUANTITY) QUANTITY
+  FROM ORDERS A, ORDER_ITEMS B
+     , (SELECT LEVEL AS RCNT FROM DUAL CONNECT BY LEVEL <= 2)
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+   AND A.ORDER_MODE IN ('online', 'direct')
+   AND B.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND B.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+   AND RCNT <= CASE WHEN A.ORDER_MODE = 'online' THEN 2 ELSE 1 END
+ GROUP BY TO_CHAR(A.ORDER_DATE, 'YYYYMMDD')
+        , CASE WHEN RCNT = 2 THEN 'BBB' ELSE 'AAA' END
+        , B.PRODUCT_ID;
+```
+
+ORDER_MODE가 `online`인 경우만 2배로 증가. `RCNT = 2`인 경우는 BBB, 그 외는 AAA로 집계.
+
+> **Buffers: 30,812 → 17,463으로 개선.**
+
+---
+
+## Section 04. UNION ALL 반복 ACCESS - 소계 처리 함수의 활용
+
+소계를 구할 때 Oracle에 내장되어 있는 소계 처리 함수 사용 방법이 많이 보급되었지만, 실무에서 UNION ALL로 반복 ACCESS하는 경우가 간혹 발생.
+
+#### 튜닝 전
+
+```sql
+SELECT A.CUSTOMER_ID
+     , A.EMPLOYEE_ID
+     , B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY) ORDER_AMT
+  FROM ORDERS A, ORDER_ITEMS B, PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+ GROUP BY A.CUSTOMER_ID, A.EMPLOYEE_ID, B.PRODUCT_ID
+UNION ALL
+SELECT '고객합' CUSTOMER_ID
+     , A.EMPLOYEE_ID
+     , B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY) ORDER_AMT
+  FROM ORDERS A, ORDER_ITEMS B, PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+ GROUP BY A.EMPLOYEE_ID, B.PRODUCT_ID
+UNION ALL
+SELECT '고객합' CUSTOMER_ID
+     , '사원합' EMPLOYEE_ID
+     , B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY) ORDER_AMT
+  FROM ORDERS A, ORDER_ITEMS B, PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+ GROUP BY B.PRODUCT_ID;
+```
+
+소계를 구하기 위해 GROUP BY 레벨에 따라서 UNION ALL로 같은 테이블 같은 데이터 구간을 **3번 반복 ACCESS**.
+
+> **참고: PLACE_GROUP_BY 쿼리 변환**
+> Oracle 11g에서 새로 추가된 쿼리 변환 기능. GROUP BY를 통해 선행 테이블 건수를 줄인 후 후행 테이블과 JOIN하는 기능. 관련 힌트: `/*+ PLACE_GROUP_BY */`, 이를 막으려면 `/*+ NO_PLACE_GROUP_BY */`. 최종 GROUP BY 건수와 중간 GROUP BY 건수가 거의 비슷한 경우 불필요한 GROUP BY가 한 번 더 수행된 것이므로 힌트로 제어하는 것이 유리.
+
+#### 튜닝 후 - GROUPING SETS 활용
+
+```sql
+SELECT NVL(A.CUSTOMER_ID, '고객합') CUSTOMER_ID
+     , NVL(A.EMPLOYEE_ID, '사원합') EMPLOYEE_ID
+     , B.PRODUCT_ID
+     , SUM(B.UNIT_PRICE * B.QUANTITY) ORDER_AMT
+  FROM ORDERS A, ORDER_ITEMS B, PRODUCTS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND B.PRODUCT_ID = C.PRODUCT_ID
+   AND A.ORDER_DATE >= TO_DATE('20120101', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120102', 'YYYYMMDD')
+ GROUP BY GROUPING SETS(
+    (A.CUSTOMER_ID, A.EMPLOYEE_ID, B.PRODUCT_ID),
+    (A.EMPLOYEE_ID, B.PRODUCT_ID)
+ );
+```
+
+옵티마이저가 GROUPING SETS를 ROLLUP으로 변환하여 실행.
+
+> **Buffers: 34,839 → 11,613으로 개선.**
+
+---
+
+## Section 05. UNION ALL 반복 ACCESS - WITH 문의 활용
+
+UNION ALL로 반복 사용된 테이블이 **일부만 같은 경우**.
+
+#### 튜닝 전
+
+```sql
+SELECT 'SELL' SELES_TYPE
+     , C.FIRST_NAME SALES_NAME
+     , SUM(B.QUANTITY) QUANTITY
+  FROM ORDERS A, ORDER_ITEMS B, EMPLOYEES C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND A.EMPLOYEE_ID = C.EMPLOYEE_ID
+   AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+   AND A.ORDER_MODE IN ('online', 'direct')
+ GROUP BY C.FIRST_NAME
+UNION ALL
+SELECT 'BUY' SELES_TYPE
+     , C.CUST_FIRST_NAME SALES_NAME
+     , SUM(B.QUANTITY) QUANTITY
+  FROM ORDERS A, ORDER_ITEMS B, CUSTOMERS C
+ WHERE A.ORDER_ID = B.ORDER_ID
+   AND A.CUSTOMER_ID = C.CUSTOMER_ID
+   AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+   AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+   AND A.ORDER_MODE IN ('online', 'direct')
+ GROUP BY C.CUST_FIRST_NAME;
+```
+
+ORDERS와 ORDER_ITEMS 부분만 공통적으로 반복 ACCESS하고, 서로 각각 다른 테이블(EMPLOYEES, CUSTOMERS)과 JOIN.
+
+### WITH 문 특징 (11g~)
+
+- SQL 상에서 반복 사용되며 WHERE 조건이나 GROUP BY로 건수가 크게 줄어드는 경우 효율적
+- 한 번만 읽어서 **TEMP TABLESPACE에 데이터 셋으로 저장** 후 재사용
+- WITH 문에서 정의되는 건수가 많으면 I/O도 TEMP TABLESPACE 사용량도 높아지므로 주의
+- **`MATERIALIZE`** 힌트: 데이터 셋을 임시 테이블 형태로 저장. SELECT 절에서 WITH 절 명칭을 **두 번 이상 사용하면 자동으로 MATERIALIZE**
+- **`INLINE`** 힌트: 반대로 INLINE VIEW처럼 사용
+
+#### 튜닝 후 - WITH MATERIALIZE 활용
+
+```sql
+WITH TEMP_ORDER_DATA AS (
+    SELECT /*+ MATERIALIZE */
+           A.EMPLOYEE_ID, A.CUSTOMER_ID
+         , SUM(B.QUANTITY) QUANTITY
+      FROM ORDERS A, ORDER_ITEMS B
+     WHERE A.ORDER_ID = B.ORDER_ID
+       AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+       AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+       AND A.ORDER_MODE IN ('online', 'direct')
+     GROUP BY A.EMPLOYEE_ID, A.CUSTOMER_ID
+)
+SELECT 'SELL' SELES_TYPE
+     , C.FIRST_NAME SALES_NAME
+     , SUM(A.QUANTITY) QUANTITY
+  FROM TEMP_ORDER_DATA A, EMPLOYEES C
+ WHERE A.EMPLOYEE_ID = C.EMPLOYEE_ID
+ GROUP BY C.FIRST_NAME
+UNION ALL
+SELECT 'BUY' SELES_TYPE
+     , C.CUST_FIRST_NAME SALES_NAME
+     , SUM(A.QUANTITY) QUANTITY
+  FROM TEMP_ORDER_DATA A, CUSTOMERS C
+ WHERE A.CUSTOMER_ID = C.CUSTOMER_ID
+ GROUP BY C.CUST_FIRST_NAME;
+```
+
+실행 계획상 **TEMP TABLE TRANSFORMATION** Operation이 WITH 절로 선언된 SQL이 데이터 셋으로 생성되었다는 의미. `SYS_TEMP_xxx`가 WITH 절의 데이터 셋 테이블 명이 되며, 적은 건수를 SCAN하기 때문에 I/O가 매우 낮음.
+
+> **19c vs 11g 차이점**: 19c에서는 WITH 절 데이터 셋이 메모리에 저장되어 재사용 시 Buffers 통계값이 0. 또한 생성 시 TEMP 세그먼트 명이 나타나므로 어떤 WITH 절에서 생성되었는지 쉽게 파악 가능.
+
+---
+
+## Section 06. UPDATE문 서브쿼리 반복 ACCESS - MERGE 문 활용
+
+#### 튜닝 전
+
+```sql
+UPDATE ORDERS A
+   SET ORDER_TOTAL = (SELECT SUM(UNIT_PRICE * QUANTITY)
+                        FROM ORDER_ITEMS B
+                       WHERE A.ORDER_ID = B.ORDER_ID
+                         AND B.PRODUCT_ID <> 'P065')
+ WHERE ORDER_ID IN (SELECT ORDER_ID
+                      FROM ORDER_ITEMS C
+                     WHERE ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+                       AND ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+                       AND PRODUCT_ID <> 'P065');
+```
+
+WHERE 절에서 ORDER_ITEMS를 사용하고, SET 절에서 UPDATE하기 위해 다시 한 번 **반복 ACCESS**.
+
+### MERGE 문 사용 방법
+
+```sql
+MERGE INTO TABLE_NAME_1 A
+USING (SELECT ... FROM TABLE_NAME_2 WHERE ..) B
+   ON (A.JOIN_KEY = B.JOIN_KEY)
+ WHEN MATCHED THEN
+      UPDATE SET A.COL1 = B.COL2
+ WHEN NOT MATCHED THEN
+      INSERT (A.COL1, A.COL2 ..) VALUES (B.COL1, B.COL2 ..);
+```
+
+- USING 절에 UPDATE 시 참조할 SQL을 넣음
+- A와 JOIN 성공 시 UPDATE, USING() B의 결과가 A와 JOIN되지 않는 결과 셋은 INSERT
+- **10g 이후로는 UPDATE만 필요할 경우 INSERT 부분 생략 가능**
+
+#### 튜닝 후
+
+```sql
+MERGE INTO ORDERS A
+USING (SELECT B.ORDER_ID
+            , SUM(UNIT_PRICE * QUANTITY) ORDER_TOTAL
+         FROM ORDER_ITEMS B
+        WHERE B.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+          AND B.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+          AND B.PRODUCT_ID <> 'P065'
+        GROUP BY B.ORDER_ID) B
+   ON (A.ORDER_ID = B.ORDER_ID)
+ WHEN MATCHED THEN
+      UPDATE SET A.ORDER_TOTAL = B.ORDER_TOTAL;
+```
+
+> **MERGE 문 사용으로 ORDER_ITEMS를 한 번만 ACCESS. Buffers 개선.**
+
+---
+
+## Section 07. MERGE 대상 테이블 반복 ACCESS
+
+MERGE 문 사용 시 **불필요한 JOIN**으로 인한 성능 저하 사례.
+
+#### 튜닝 전
+
+```sql
+MERGE INTO ORDERS A
+USING (SELECT B.ORDER_ID
+            , SUM(UNIT_PRICE * QUANTITY) ORDER_TOTAL
+         FROM ORDERS A, ORDER_ITEMS B
+        WHERE A.ORDER_ID = B.ORDER_ID
+          AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+          AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+          AND B.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+          AND B.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+          AND B.PRODUCT_ID <> 'P065'
+        GROUP BY B.ORDER_ID) B
+   ON (A.ORDER_ID = B.ORDER_ID)
+ WHEN MATCHED THEN
+      UPDATE SET A.ORDER_TOTAL = B.ORDER_TOTAL;
+```
+
+ORDERS로 MERGE가 되고 있으며 ON() 절에서 ORDER_ID로 JOIN하기 때문에, USING 절에서 ORDERS와 JOIN해서 INNER JOIN된 ORDER_ID만 UPDATE하려는 의도이지만 **불필요한 JOIN**.
+
+#### 튜닝 후
+
+```sql
+MERGE INTO ORDERS A
+USING (SELECT B.ORDER_ID
+            , SUM(UNIT_PRICE * QUANTITY) ORDER_TOTAL
+         FROM ORDER_ITEMS B
+        WHERE B.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+          AND B.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD')
+          AND B.PRODUCT_ID <> 'P065'
+        GROUP BY B.ORDER_ID) B
+   ON (A.ORDER_ID = B.ORDER_ID
+       AND A.ORDER_DATE >= TO_DATE('20120805', 'YYYYMMDD')
+       AND A.ORDER_DATE <  TO_DATE('20120807', 'YYYYMMDD'))
+ WHEN MATCHED THEN
+      UPDATE SET A.ORDER_TOTAL = B.ORDER_TOTAL;
+```
+
+USING 절에 있는 ORDER_DATE 조건을 ON 절로 이동 후, USING 절에서의 **불필요한 ORDERS 테이블 JOIN 제거**.
+
+> 테이블 사이즈가 큰 배치 SQL에서 대용량 테이블과 불필요한 JOIN을 하게 되면 성능이 크게 저하되므로 주의.
+
+---
+
+## 요약
+
+| 패턴 | 튜닝 기법 |
+|------|-----------|
+| 서브쿼리/인라인 뷰로 같은 테이블 반복 ACCESS | RANK(), SUM() OVER 등 **분석 함수**로 1회 스캔 |
+| UNION ALL로 같은 조건·다른 계산식 반복 | **CASE/DECODE**로 하나의 SQL로 통합 |
+| UNION ALL로 일부 조건만 N배 집계 | **선택적 카테시안 JOIN** (LEVEL + CASE) |
+| 소계를 UNION ALL로 반복 | **GROUPING SETS** 사용 |
+| UNION ALL로 일부 테이블만 공통 반복 | **WITH (MATERIALIZE)**로 공통 구간 1회 저장 후 재사용 |
+| UPDATE 서브쿼리로 반복 ACCESS | **MERGE 문**으로 USING 1회만 참조 |
+| MERGE USING에 대상 테이블 불필요 JOIN | 조건은 **ON 절**로, USING에는 필요한 집계만 |
