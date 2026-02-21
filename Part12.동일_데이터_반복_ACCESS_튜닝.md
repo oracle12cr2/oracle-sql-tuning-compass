@@ -1,19 +1,16 @@
-# Part 12. 동일 데이터 반복 ACCESS 튜닝
+Part 12. 동일 데이터 반복 ACCESS 튜닝
 
-## Section 01. 서브쿼리 OR 인라인 뷰를 통한 반복 ACCESS - 분석 함수 활용
+Section 01. 서브쿼리 OR 인라인 뷰를 통한 반복 ACCESS - 분석 함수 활용
 
-### 첫 번째: MAX를 구하기 위한 서브쿼리 반복 ACCESS
+첫 번째: MAX를 구하기 위한 서브쿼리 반복 ACCESS
 
 **ORDERS 테이블 현황**
-
 | 항목 | 내용 |
 |------|------|
 | 데이터 범위 | 20070101 ~ 20121231 |
 | 총 건수 | 3,000,000건 |
 | 총 BLOCK 수 | 19,791 BLOCK |
 | INDEX | IX_ORDERS_N1 - ORDER_DATE |
-
-#### 튜닝 전
 
 ```sql
 SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, EMPLOYEE_ID
@@ -31,7 +28,7 @@ SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, EMPLOYEE_ID
 
 ORDER_DATE 구간에서 CUSTOMER_ID별 마지막 주문 일자(ORDER_DATE)를 구하기 위해서 ORDERS 테이블을 **메인쿼리에서 읽고 서브쿼리에서 반복**.
 
-#### 튜닝 후 - RANK() 분석 함수 활용
+튜닝 후 - RANK() 분석 함수 활용
 
 ```sql
 SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID, EMPLOYEE_ID
