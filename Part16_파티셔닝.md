@@ -349,7 +349,8 @@ INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))
 -- 2024년 2월 데이터 INSERT 시 자동으로 파티션 생성!
 ```
 
-#### 📌 상세 예제: 월별 INTERVAL 파티셔닝
+<details>
+<summary><b>📌 상세 예제: 월별 INTERVAL 파티셔닝 (클릭하여 펼치기)</b></summary>
 
 **1단계: 테이블 생성**
 
@@ -440,7 +441,10 @@ SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
 ---------------------------------------------------------------------
 ```
 
-#### 📌 INTERVAL 유형별 예제
+</details>
+
+<details>
+<summary><b>📌 INTERVAL 유형별 예제 (일별/분기별/연도별) (클릭하여 펼치기)</b></summary>
 
 **일별 파티셔닝** — 로그, 트랜잭션 등 대량 일별 데이터
 
@@ -498,7 +502,11 @@ INTERVAL (NUMTOYMINTERVAL(12, 'MONTH'))
 );
 ```
 
-#### 📌 INTERVAL 파티셔닝 + Local INDEX
+</details>
+
+<details>
+<summary><b>📌 INTERVAL 파티셔닝 + Local INDEX (클릭하여 펼치기)</b></summary>
+
 
 ```sql
 -- INTERVAL 파티셔닝 테이블에 Local INDEX 생성
@@ -514,7 +522,11 @@ WHERE  INDEX_NAME = 'IDX_SALES_ORDERS_CUST'
 ORDER BY PARTITION_POSITION;
 ```
 
-#### 📌 자동 생성된 파티션 이름 변경
+</details>
+
+<details>
+<summary><b>📌 자동 생성된 파티션 이름 변경 (클릭하여 펼치기)</b></summary>
+
 
 ```sql
 -- Oracle이 자동 부여한 이름(SYS_P101)을 가독성 좋게 변경
@@ -529,7 +541,11 @@ WHERE  TABLE_NAME = 'SALES_ORDERS'
 ORDER BY PARTITION_POSITION;
 ```
 
-#### 📌 INTERVAL 파티셔닝 운영 팁
+</details>
+
+<details>
+<summary><b>📌 INTERVAL 파티셔닝 운영 팁 (클릭하여 펼치기)</b></summary>
+
 
 | 항목 | 설명 |
 |------|------|
@@ -548,6 +564,8 @@ ALTER TABLE SALES_ORDERS SET INTERVAL ();
 -- 다시 활성화
 ALTER TABLE SALES_ORDERS SET INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'));
 ```
+
+</details>
 
 ---
 
