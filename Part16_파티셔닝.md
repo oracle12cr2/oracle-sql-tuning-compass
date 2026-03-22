@@ -330,6 +330,10 @@ SUBPARTITION BY RANGE (SALE_DATE)
 
 RANGE 파티셔닝의 확장형. 데이터 도착 시 **자동으로 새 파티션 생성**.
 
+기존 RANGE 파티셔닝은 DBA가 미리 파티션을 수동 생성해야 하지만, INTERVAL은 데이터가 들어오면 Oracle이 알아서 만들어준다.
+
+#### 기본 문법
+
 ```sql
 CREATE TABLE SALES_ORDERS (
   ORDER_ID    NUMBER,
@@ -343,6 +347,206 @@ INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))
   PARTITION P_202401 VALUES LESS THAN (TO_DATE('20240201', 'YYYYMMDD'))
 );
 -- 2024년 2월 데이터 INSERT 시 자동으로 파티션 생성!
+```
+
+#### 📌 상세 예제: 월별 INTERVAL 파티셔닝
+
+**1단계: 테이블 생성**
+
+시작 파티션 1개만 정의하면 나머지는 자동 생성.
+
+```sql
+-- 월별 자동 파티셔닝 테이블
+CREATE TABLE SALES_ORDERS (
+  ORDER_ID    NUMBER GENERATED ALWAYS AS IDENTITY,
+  ORDER_DATE  DATE NOT NULL,
+  CUSTOMER_ID NUMBER,
+  PRODUCT_ID  NUMBER,
+  ORDER_TOTAL NUMBER(12,2),
+  STATUS      VARCHAR2(20) DEFAULT 'PENDING'
+)
+PARTITION BY RANGE (ORDER_DATE)
+INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'))
+(
+  -- 시작 파티션: 2024년 1월 이전 데이터
+  PARTITION P_BEFORE_202401 VALUES LESS THAN (TO_DATE('2024-01-01', 'YYYY-MM-DD'))
+)
+TABLESPACE USERS;
+```
+
+**2단계: 데이터 INSERT → 자동 파티션 생성 확인**
+
+```sql
+-- 2024년 1월 데이터 INSERT → 기존 파티션 범위 밖이므로 새 파티션 자동 생성!
+INSERT INTO SALES_ORDERS (ORDER_DATE, CUSTOMER_ID, PRODUCT_ID, ORDER_TOTAL)
+VALUES (TO_DATE('2024-01-15', 'YYYY-MM-DD'), 1001, 501, 50000);
+
+-- 2024년 3월 데이터 → 2월 파티션 건너뛰고 3월 파티션 자동 생성 (비어있는 2월은 안 만듦)
+INSERT INTO SALES_ORDERS (ORDER_DATE, CUSTOMER_ID, PRODUCT_ID, ORDER_TOTAL)
+VALUES (TO_DATE('2024-03-20', 'YYYY-MM-DD'), 1002, 502, 75000);
+
+-- 2024년 6월 데이터
+INSERT INTO SALES_ORDERS (ORDER_DATE, CUSTOMER_ID, PRODUCT_ID, ORDER_TOTAL)
+VALUES (TO_DATE('2024-06-10', 'YYYY-MM-DD'), 1003, 503, 120000);
+
+COMMIT;
+```
+
+**3단계: 생성된 파티션 확인**
+
+```sql
+-- 자동 생성된 파티션 목록 확인
+SELECT PARTITION_NAME,
+       PARTITION_POSITION,
+       HIGH_VALUE,
+       NUM_ROWS,
+       TABLESPACE_NAME
+FROM   USER_TAB_PARTITIONS
+WHERE  TABLE_NAME = 'SALES_ORDERS'
+ORDER BY PARTITION_POSITION;
+```
+
+결과 예시:
+```
+PARTITION_NAME     POS  HIGH_VALUE                                       NUM_ROWS  TABLESPACE
+-----------------  ---  -----------------------------------------------  --------  ----------
+P_BEFORE_202401      1  TO_DATE('2024-01-01 00:00:00', 'SYYYY-MM-DD')          0  USERS
+SYS_P101             2  TO_DATE('2024-02-01 00:00:00', 'SYYYY-MM-DD')          1  USERS      ← 자동 생성!
+SYS_P102             3  TO_DATE('2024-04-01 00:00:00', 'SYYYY-MM-DD')          1  USERS      ← 3월 데이터
+SYS_P103             4  TO_DATE('2024-07-01 00:00:00', 'SYYYY-MM-DD')          1  USERS      ← 6월 데이터
+```
+
+> 💡 **핵심 포인트**: 2월(P_202402)은 데이터가 없으므로 파티션이 생성되지 않았다! INTERVAL은 데이터가 실제로 INSERT될 때만 파티션을 만든다.
+
+**4단계: 파티션 Pruning 확인**
+
+```sql
+-- 2024년 3월 데이터만 조회 → SYS_P102 파티션만 SCAN
+EXPLAIN PLAN FOR
+SELECT * FROM SALES_ORDERS
+WHERE  ORDER_DATE >= TO_DATE('2024-03-01', 'YYYY-MM-DD')
+AND    ORDER_DATE <  TO_DATE('2024-04-01', 'YYYY-MM-DD');
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+```
+
+```
+---------------------------------------------------------------------
+| Id  | Operation              | Name         | Pstart| Pstop |
+---------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |              |       |       |
+|   1 |  PARTITION RANGE SINGLE|              |     3 |     3 |  ← 3번 파티션만!
+|   2 |   TABLE ACCESS FULL    | SALES_ORDERS |     3 |     3 |
+---------------------------------------------------------------------
+```
+
+#### 📌 INTERVAL 유형별 예제
+
+**일별 파티셔닝** — 로그, 트랜잭션 등 대량 일별 데이터
+
+```sql
+CREATE TABLE ACCESS_LOG (
+  LOG_ID     NUMBER GENERATED ALWAYS AS IDENTITY,
+  LOG_TIME   DATE NOT NULL,
+  USER_ID    NUMBER,
+  ACTION     VARCHAR2(100),
+  IP_ADDR    VARCHAR2(45)
+)
+PARTITION BY RANGE (LOG_TIME)
+INTERVAL (NUMTODSINTERVAL(1, 'DAY'))
+(
+  PARTITION P_INIT VALUES LESS THAN (TO_DATE('2024-01-01', 'YYYY-MM-DD'))
+);
+
+-- 하루 단위로 자동 파티션 생성 → 오래된 파티션 DROP으로 손쉬운 데이터 정리!
+-- ALTER TABLE ACCESS_LOG DROP PARTITION SYS_P200;  -- 특정 날짜 데이터 즉시 삭제
+```
+
+**분기별 파티셔닝** — 재무제표, 분기 리포트
+
+```sql
+CREATE TABLE FINANCIAL_REPORTS (
+  REPORT_ID    NUMBER,
+  REPORT_DATE  DATE NOT NULL,
+  DEPT_ID      NUMBER,
+  REVENUE      NUMBER(15,2),
+  EXPENSES     NUMBER(15,2)
+)
+PARTITION BY RANGE (REPORT_DATE)
+INTERVAL (NUMTOYMINTERVAL(3, 'MONTH'))
+(
+  PARTITION P_Q1_2024 VALUES LESS THAN (TO_DATE('2024-04-01', 'YYYY-MM-DD'))
+);
+
+-- 3개월(분기) 단위로 자동 파티션 생성
+```
+
+**연도별 파티셔닝** — 아카이브, 이력 관리
+
+```sql
+CREATE TABLE CONTRACT_HISTORY (
+  CONTRACT_ID   NUMBER,
+  START_DATE    DATE NOT NULL,
+  END_DATE      DATE,
+  CUSTOMER_ID   NUMBER,
+  CONTRACT_AMT  NUMBER(15,2)
+)
+PARTITION BY RANGE (START_DATE)
+INTERVAL (NUMTOYMINTERVAL(12, 'MONTH'))
+(
+  PARTITION P_2020 VALUES LESS THAN (TO_DATE('2021-01-01', 'YYYY-MM-DD'))
+);
+```
+
+#### 📌 INTERVAL 파티셔닝 + Local INDEX
+
+```sql
+-- INTERVAL 파티셔닝 테이블에 Local INDEX 생성
+CREATE INDEX IDX_SALES_ORDERS_CUST ON SALES_ORDERS (CUSTOMER_ID) LOCAL;
+
+-- Local INDEX도 파티션이 자동 생성될 때 함께 자동 생성됨!
+-- 파티션 관리(DROP, TRUNCATE 등) 시 인덱스도 자동 정리
+
+-- 확인
+SELECT INDEX_NAME, PARTITION_NAME, STATUS
+FROM   USER_IND_PARTITIONS
+WHERE  INDEX_NAME = 'IDX_SALES_ORDERS_CUST'
+ORDER BY PARTITION_POSITION;
+```
+
+#### 📌 자동 생성된 파티션 이름 변경
+
+```sql
+-- Oracle이 자동 부여한 이름(SYS_P101)을 가독성 좋게 변경
+ALTER TABLE SALES_ORDERS RENAME PARTITION SYS_P101 TO P_202401;
+ALTER TABLE SALES_ORDERS RENAME PARTITION SYS_P102 TO P_202403;
+ALTER TABLE SALES_ORDERS RENAME PARTITION SYS_P103 TO P_202406;
+
+-- 확인
+SELECT PARTITION_NAME, HIGH_VALUE
+FROM   USER_TAB_PARTITIONS
+WHERE  TABLE_NAME = 'SALES_ORDERS'
+ORDER BY PARTITION_POSITION;
+```
+
+#### 📌 INTERVAL 파티셔닝 운영 팁
+
+| 항목 | 설명 |
+|------|------|
+| **파티션 Pruning** | WHERE 조건에 파티션 KEY(ORDER_DATE)가 반드시 포함되어야 Pruning 효과 발생 |
+| **빈 파티션** | 데이터 없는 기간은 파티션이 생성되지 않음 → 저장 공간 절약 |
+| **파티션 DROP** | `ALTER TABLE ... DROP PARTITION ...` 으로 특정 기간 데이터 즉시 삭제 (DELETE보다 훨씬 빠름) |
+| **EXCHANGE PARTITION** | 파티션을 일반 테이블과 교환 → 대량 데이터 적재/아카이빙에 활용 |
+| **INTERVAL → RANGE 전환** | `SET INTERVAL ()` 으로 자동 생성 비활성화 가능 |
+| **주의사항** | INTERVAL은 NUMBER, DATE 타입만 지원. VARCHAR2 불가 |
+| **SYS_P 이름** | 자동 생성 파티션명이 SYS_Pxxx로 생성됨 → 운영 시 RENAME 권장 |
+
+```sql
+-- INTERVAL 비활성화 (더 이상 자동 생성 안 함 → RANGE로 전환)
+ALTER TABLE SALES_ORDERS SET INTERVAL ();
+
+-- 다시 활성화
+ALTER TABLE SALES_ORDERS SET INTERVAL (NUMTOYMINTERVAL(1, 'MONTH'));
 ```
 
 ---
