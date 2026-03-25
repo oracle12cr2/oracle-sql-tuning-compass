@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Case 04: JPPD (Join Predicate Push Down) 활용
 -- 핵심 튜닝 기법: 인라인뷰/UNION ALL VIEW로 조건 침투시켜 불필요한 데이터 제거
--- 관련 단원: JOIN (JPPD)
+-- 관련 단원: JOIN PREDICATE PUSH DOWN
+-- 공통 데이터 세트: T_CUSTOMER + T_ORDER 테이블 사용
 -- =============================================================================
 
 -- 환경 설정
@@ -12,252 +13,272 @@ SET AUTOTRACE ON
 SET LINESIZE 200
 SET PAGESIZE 50
 
--- 정리 (재실행 시)
-DROP VIEW V_처리내역;
-DROP TABLE SCHEMA1_처리내역 CASCADE CONSTRAINTS PURGE;
-DROP TABLE SCHEMA2_처리내역 CASCADE CONSTRAINTS PURGE;
-DROP TABLE 메타기본 CASCADE CONSTRAINTS PURGE;
-DROP TABLE BPM_이력전송 CASCADE CONSTRAINTS PURGE;
+-- 공통 데이터 세트 확인
+SELECT '데이터 확인' AS 구분,
+       (SELECT COUNT(*) FROM T_CUSTOMER) AS CUSTOMER_건수,
+       (SELECT COUNT(*) FROM T_ORDER) AS ORDER_건수
+FROM DUAL;
 
 PROMPT
 PROMPT ========================================
-PROMPT 1. 테스트 테이블 및 VIEW 생성
-PROMPT ========================================
-
--- SCHEMA1.처리내역 테이블 생성
-CREATE TABLE SCHEMA1_처리내역 AS
-SELECT 
-    'PRC' || LPAD(rownum, 10, '0') AS 처리아이디,
-    'CUS' || LPAD(MOD(rownum-1, 10000) + 1, 8, '0') AS 고객아이디,
-    CASE MOD(rownum, 4)
-        WHEN 0 THEN '완료'
-        WHEN 1 THEN '진행중'
-        WHEN 2 THEN '대기'
-        ELSE '취소'
-    END AS 상태,
-    SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 365)) AS 완료시간,
-    'TLN' || MOD(rownum, 1000) AS 설명
-FROM dual 
-CONNECT BY level <= 2000000;  -- 200만건
-
--- SCHEMA2.처리내역 테이블 생성
-CREATE TABLE SCHEMA2_처리내역 AS
-SELECT 
-    'PRC' || LPAD(rownum + 2000000, 10, '0') AS 처리아이디,
-    'CUS' || LPAD(MOD(rownum-1, 10000) + 1, 8, '0') AS 고객아이디,
-    CASE MOD(rownum, 4)
-        WHEN 0 THEN '완료'
-        WHEN 1 THEN '진행중'
-        WHEN 2 THEN '대기'
-        ELSE '취소'
-    END AS 상태,
-    SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 365)) AS 완료시간,
-    'TLN' || MOD(rownum, 1000) AS 설명
-FROM dual 
-CONNECT BY level <= 2000000;  -- 200만건
-
--- UNION ALL VIEW 생성 (총 400만건)
-CREATE VIEW V_처리내역 AS
-SELECT 처리아이디, 고객아이디, 상태, 완료시간, 설명 FROM SCHEMA1_처리내역
-UNION ALL
-SELECT 처리아이디, 고객아이디, 상태, 완료시간, 설명 FROM SCHEMA2_처리내역;
-
--- 메타기본 테이블 생성
-CREATE TABLE 메타기본 AS
-SELECT 
-    'CUS' || LPAD(rownum, 8, '0') AS 인덱스ID,
-    '고객' || rownum AS 고객명,
-    CASE MOD(rownum, 3) WHEN 0 THEN 'VIP' WHEN 1 THEN '일반' ELSE '휴면' END AS 등급
-FROM dual
-CONNECT BY level <= 10000;
-
--- BPM_이력전송 테이블 생성
-CREATE TABLE BPM_이력전송 AS
-SELECT 
-    'PRC' || LPAD(MOD(rownum-1, 3000000) + 1, 10, '0') AS 처리아이디,
-    SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 30)) AS 변경시간,
-    '처리완료' AS 상태
-FROM dual
-CONNECT BY level <= 500;  -- 최근 처리 500건
-
--- INDEX 생성
-CREATE INDEX IDX_SCHEMA1_처리내역_01 ON SCHEMA1_처리내역 (처리아이디);
-CREATE INDEX IDX_SCHEMA2_처리내역_01 ON SCHEMA2_처리내역 (처리아이디);
-CREATE INDEX IDX_BPM_이력전송_01 ON BPM_이력전송 (변경시간);
-CREATE INDEX IDX_메타기본_01 ON 메타기본 (인덱스ID);
-
--- PK 생성
-ALTER TABLE SCHEMA1_처리내역 ADD CONSTRAINT PK_SCHEMA1_처리내역 PRIMARY KEY (처리아이디);
-ALTER TABLE SCHEMA2_처리내역 ADD CONSTRAINT PK_SCHEMA2_처리내역 PRIMARY KEY (처리아이디);
-ALTER TABLE 메타기본 ADD CONSTRAINT PK_메타기본 PRIMARY KEY (인덱스ID);
-
--- 통계 정보 수집
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, 'SCHEMA1_처리내역');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, 'SCHEMA2_처리내역');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '메타기본');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, 'BPM_이력전송');
-
--- 테이블 크기 확인
-SELECT table_name 테이블명, num_rows 건수
-FROM user_tables 
-WHERE table_name IN ('SCHEMA1_처리내역', 'SCHEMA2_처리내역', '메타기본', 'BPM_이력전송')
-ORDER BY num_rows DESC;
-
-PROMPT
-PROMPT ========================================
-PROMPT 2. 튜닝 전 SQL 및 실행계획 (JPPD 미발생)
-PROMPT ========================================
-
--- 바인드 변수 설정
-VARIABLE JobDate VARCHAR2(8);
-EXEC :JobDate := TO_CHAR(SYSDATE-1, 'YYYYMMDD');
-
-PRINT JobDate
-
--- 튜닝 전 SQL (VIEW 전체 SCAN 후 HASH JOIN)
-SELECT 
-    A.인덱스ID, B.상태,
-    TO_CHAR(B.완료시간, 'YYYYMMDDHH24MISS') 완료시간
-FROM 메타기본 A,
-     (SELECT 
-          B.고객아이디, B.처리아이디, B.상태,
-          B.완료시간, B.설명
-      FROM (
-          SELECT 처리아이디
-          FROM BPM_이력전송
-          WHERE 변경시간 BETWEEN TO_DATE(:JobDate, 'YYYYMMDD')
-                            AND TO_DATE(:JobDate, 'YYYYMMDD') + 1
-          GROUP BY 처리아이디
-      ) A, V_처리내역 B
-      WHERE A.처리아이디 = B.처리아이디
-        AND B.설명 LIKE 'TLN%'
-     ) B
-WHERE A.인덱스ID = B.고객아이디;
-
-PROMPT
-PROMPT ========================================
-PROMPT 3. 튜닝 후 SQL 및 실행계획 (JPPD 발생)
-PROMPT ========================================
-
--- 튜닝 후 SQL (USE_NL 힌트로 JPPD 유도)
-SELECT /*+ USE_NL(A B) */
-    A.인덱스ID, B.상태,
-    TO_CHAR(B.완료시간, 'YYYYMMDDHH24MISS') 완료시간
-FROM 메타기본 A,
-     (SELECT /*+ NO_MERGE USE_NL(A B) */
-          B.고객아이디, B.처리아이디, B.상태,
-          B.완료시간, B.설명
-      FROM (
-          SELECT 처리아이디
-          FROM BPM_이력전송
-          WHERE 변경시간 BETWEEN TO_DATE(:JobDate, 'YYYYMMDD')
-                            AND TO_DATE(:JobDate, 'YYYYMMDD') + 1
-          GROUP BY 처리아이디
-      ) A, V_처리내역 B
-      WHERE A.처리아이디 = B.처리아이디
-        AND B.설명 LIKE 'TLN%'
-     ) B
-WHERE A.인덱스ID = B.고객아이디;
-
-PROMPT
-PROMPT ========================================
-PROMPT 4. JPPD 확인용 추가 힌트 테스트
-PROMPT ========================================
-
--- 옵티마이저 파라미터로 JPPD 강제 활성화
-SELECT /*+ 
-    OPT_PARAM('_optimizer_push_pred_cost_based' 'false')
-    USE_NL(A B) 
-*/
-    A.인덱스ID, B.상태,
-    TO_CHAR(B.완료시간, 'YYYYMMDDHH24MISS') 완료시간
-FROM 메타기본 A,
-     (SELECT /*+ NO_MERGE USE_NL(A B) PUSH_PRED(B) */
-          B.고객아이디, B.처리아이디, B.상태,
-          B.완료시간, B.설명
-      FROM (
-          SELECT 처리아이디
-          FROM BPM_이력전송
-          WHERE 변경시간 BETWEEN TO_DATE(:JobDate, 'YYYYMMDD')
-                            AND TO_DATE(:JobDate, 'YYYYMMDD') + 1
-          GROUP BY 처리아이디
-      ) A, V_처리내역 B
-      WHERE A.처리아이디 = B.처리아이디
-        AND B.설명 LIKE 'TLN%'
-     ) B
-WHERE A.인덱스ID = B.고객아이디;
-
-PROMPT
-PROMPT ========================================
-PROMPT 5. 성능 분석 및 튜닝 포인트
+PROMPT 1. JPPD (Join Predicate Push Down) 시나리오 설명
 PROMPT ========================================
 
 /*
- 핵심 튜닝 포인트 분석:
- 
- 1. 문제점:
-    - V_처리내역 VIEW: UNION ALL로 구성 (400만건)
-    - 인라인뷰 결과 건수: 매우 적음 (수십~수백건)
-    - JPPD 미발생으로 VIEW 전체 SCAN 후 HASH JOIN
-    - 대부분 데이터가 필터링되어 버려짐
- 
- 2. JPPD(Join Predicate Push Down)란:
-    - 외부 쿼리의 JOIN 조건을 내부 VIEW/인라인뷰로 밀어넣는 기법
-    - VIEW 전체를 읽지 않고 필요한 데이터만 추출
-    - 특히 UNION ALL VIEW에서 효과적
- 
- 3. JPPD 발생 조건:
-    - NL JOIN 사용
-    - 적은 건수가 많은 건수와 JOIN
-    - VIEW/인라인뷰에 침투 가능한 구조
-    - 비용 기반으로 판단 (_optimizer_push_pred_cost_based)
- 
- 4. 튜닝 방법:
-    - USE_NL 힌트로 NL JOIN 강제
-    - NO_MERGE 힌트로 VIEW 머지 방지
-    - PUSH_PRED 힌트로 JPPD 강제 (필요시)
-    - 옵티마이저 파라미터 조정 (필요시)
- 
- 5. JPPD 확인 방법:
-    - 실행계획에서 "VIEW PUSHED PREDICATE" 또는 "UNION ALL PUSHED PREDICATE" 확인
-    - Starts 컬럼이 현저히 줄어든 것 확인
-    - VIEW 내부 각 테이블의 ACCESS 건수 확인
- 
- 6. 성과:
-    - Buffers: 2,129K → 1,155 (99.95% 개선)
-    - 실행 시간: 5분 26초 → 0.02초 (99.99% 개선)
-    - PGA 사용량: 1,217K → 0 (100% 개선)
+JPPD (Join Predicate Push Down) 개념:
+- 인라인뷰 안으로 조건을 "밀어넣어" 불필요한 데이터 제거
+- GROUP BY나 DISTINCT가 있는 인라인뷰에서 특히 효과적
+- 메모리 사용량 감소 및 처리 속도 향상
+
+시나리오: 고객별 주문 통계를 구하되, 특정 지역 고객만 조회
+문제점: 인라인뷰에서 전체 고객 집계 후 필터링 → 불필요한 연산
+해결책: JPPD로 조건을 인라인뷰 안으로 침투시켜 처리 범위 축소
 */
 
 PROMPT
 PROMPT ========================================
-PROMPT 6. 데이터 분포 확인
+PROMPT 2. 데이터 분포 및 JPPD 조건 확인
 PROMPT ========================================
 
--- BPM_이력전송에서 최근 1일 데이터 건수
-SELECT '최근 1일 BPM 이력' 구분, COUNT(*) 건수
-FROM BPM_이력전송
-WHERE 변경시간 BETWEEN TO_DATE(:JobDate, 'YYYYMMDD')
-                   AND TO_DATE(:JobDate, 'YYYYMMDD') + 1
-UNION ALL
-SELECT 'V_처리내역 전체', COUNT(*) FROM V_처리내역
-UNION ALL
-SELECT 'TLN으로 시작하는 설명', COUNT(*) FROM V_처리내역 WHERE 설명 LIKE 'TLN%';
+-- 지역별 고객 분포 확인
+SELECT region, COUNT(*) AS 고객수
+FROM T_CUSTOMER
+WHERE region IN ('R01', 'R02', 'R03', 'R04', 'R05')
+GROUP BY region
+ORDER BY region;
 
--- JOIN 결과 예상 건수
-SELECT 'JOIN 예상 결과' 구분, COUNT(*) 건수
-FROM (
-    SELECT 처리아이디
-    FROM BPM_이력전송
-    WHERE 변경시간 BETWEEN TO_DATE(:JobDate, 'YYYYMMDD')
-                       AND TO_DATE(:JobDate, 'YYYYMMDD') + 1
-    GROUP BY 처리아이디
-) A, V_처리내역 B
-WHERE A.처리아이디 = B.처리아이디
-  AND B.설명 LIKE 'TLN%'
-  AND rownum <= 1000;  -- 성능상 제한
+-- 고객별 주문 분포 (샘플링)
+SELECT 
+    '전체 고객' AS 구분, COUNT(DISTINCT cust_id) AS 고객수
+FROM T_ORDER
+UNION ALL
+SELECT 
+    '주문있는 고객', COUNT(DISTINCT cust_id)
+FROM T_ORDER
+WHERE cust_id <= 10000;  -- 샘플링
+
+PROMPT
+PROMPT ========================================
+PROMPT 3. 튜닝 전 SQL 및 실행계획 (JPPD 없음)
+PROMPT ========================================
+
+-- 바인드 변수 설정
+VARIABLE B_REGION VARCHAR2(10);
+VARIABLE B_GRADE VARCHAR2(10);
+EXEC :B_REGION := 'R01';
+EXEC :B_GRADE := 'VIP';
+
+-- 튜닝 전 SQL (JPPD 없음 - 비효율)
+-- 인라인뷰에서 전체 고객의 주문 통계를 먼저 계산 후 필터링
+SELECT 
+    c.cust_id,
+    c.cust_name,
+    c.region,
+    c.grade,
+    order_stats.주문건수,
+    order_stats.총주문금액,
+    order_stats.평균주문금액,
+    order_stats.최근주문일자
+FROM T_CUSTOMER c,
+     (SELECT 
+          cust_id,
+          COUNT(*) AS 주문건수,
+          SUM(total_amount) AS 총주문금액,
+          AVG(total_amount) AS 평균주문금액,
+          MAX(order_date) AS 최근주문일자
+      FROM T_ORDER
+      WHERE status = 'COMPLETE'
+      GROUP BY cust_id
+      HAVING COUNT(*) >= 3) order_stats
+WHERE c.cust_id = order_stats.cust_id
+  AND c.region = :B_REGION
+  AND c.grade = :B_GRADE
+ORDER BY order_stats.총주문금액 DESC;
+
+PROMPT
+PROMPT ========================================
+PROMPT 4. 튜닝 후 SQL 및 실행계획 (JPPD 적용)
+PROMPT ========================================
+
+-- 튜닝 후 SQL (JPPD 적용)
+-- 인라인뷰 안으로 고객 조건이 침투하여 처리 범위 축소
+SELECT 
+    c.cust_id,
+    c.cust_name,
+    c.region,
+    c.grade,
+    order_stats.주문건수,
+    order_stats.총주문금액,
+    order_stats.평균주문금액,
+    order_stats.최근주문일자
+FROM T_CUSTOMER c,
+     (SELECT /*+ PUSH_PRED */
+          o.cust_id,
+          COUNT(*) AS 주문건수,
+          SUM(o.total_amount) AS 총주문금액,
+          AVG(o.total_amount) AS 평균주문금액,
+          MAX(o.order_date) AS 최근주문일자
+      FROM T_ORDER o
+      WHERE o.status = 'COMPLETE'
+      GROUP BY o.cust_id
+      HAVING COUNT(*) >= 3) order_stats
+WHERE c.cust_id = order_stats.cust_id
+  AND c.region = :B_REGION
+  AND c.grade = :B_GRADE
+ORDER BY order_stats.총주문금액 DESC;
+
+PROMPT
+PROMPT ========================================
+PROMPT 5. JPPD 상세 분석
+PROMPT ========================================
+
+/*
+핵심 튜닝 포인트 분석:
+
+1. JPPD 동작 원리:
+   - 외부 쿼리의 조건(c.region = :B_REGION)이 인라인뷰로 침투
+   - 인라인뷰에서 해당 지역 고객의 주문만 GROUP BY 처리
+   - 전체 처리 데이터량 대폭 감소
+
+2. JPPD 적용 조건:
+   - 인라인뷰에 GROUP BY, DISTINCT 등 집계 연산 존재
+   - 외부 쿼리에 선택성 좋은 조건 존재
+   - 인라인뷰와 외부 테이블이 조인 키로 연결
+
+3. JPPD 발생 방법:
+   - 자동: CBO가 비용 효율적이라고 판단
+   - 수동: PUSH_PRED 힌트 사용
+   - 금지: NO_PUSH_PRED 힌트 사용
+
+4. 성과:
+   - PGA 메모리 사용량 감소 (Hash Group By 범위 축소)
+   - CPU 연산량 감소 (집계 대상 데이터 감소)
+   - 실행 시간 단축
+
+5. 실행계획 확인 포인트:
+   - "PUSHED PREDICATE" 표시 확인
+   - 인라인뷰 Cardinality 감소 확인
+   - Hash Group By 메모리 사용량 비교
+*/
+
+-- JPPD 효과 비교를 위한 추가 테스트
+PROMPT
+PROMPT === JPPD 효과 비교 ===
+
+-- 1) JPPD 금지 (NO_PUSH_PRED)
+SELECT /*+ NO_PUSH_PRED */
+    COUNT(*) AS 결과건수,
+    SUM(order_stats.총주문금액) AS 총액
+FROM T_CUSTOMER c,
+     (SELECT 
+          cust_id,
+          COUNT(*) AS 주문건수,
+          SUM(total_amount) AS 총주문금액
+      FROM T_ORDER
+      WHERE status = 'COMPLETE' 
+      GROUP BY cust_id
+      HAVING COUNT(*) >= 2) order_stats
+WHERE c.cust_id = order_stats.cust_id
+  AND c.region IN ('R01', 'R02');
+
+-- 2) JPPD 강제 적용 (PUSH_PRED)
+SELECT /*+ PUSH_PRED */
+    COUNT(*) AS 결과건수,
+    SUM(order_stats.총주문금액) AS 총액
+FROM T_CUSTOMER c,
+     (SELECT 
+          o.cust_id,
+          COUNT(*) AS 주문건수,
+          SUM(o.total_amount) AS 총주문금액
+      FROM T_ORDER o
+      WHERE o.status = 'COMPLETE'
+      GROUP BY o.cust_id  
+      HAVING COUNT(*) >= 2) order_stats
+WHERE c.cust_id = order_stats.cust_id
+  AND c.region IN ('R01', 'R02');
+
+PROMPT
+PROMPT ========================================
+PROMPT 6. 실무 적용 가이드
+PROMPT ========================================
+
+/*
+JPPD 실무 활용 가이드:
+
+✅ JPPD 적용 권장 상황:
+- 인라인뷰에 GROUP BY/DISTINCT/집계함수 있는 경우
+- 외부 테이블에 선택성 좋은 필터 조건 존재
+- 인라인뷰 처리 데이터가 전체 대비 많은 경우
+- PGA 메모리 부족으로 Temp 공간 사용하는 경우
+
+❌ JPPD 적용 주의:
+- 인라인뷰 결과가 이미 충분히 작은 경우
+- 외부 조건의 선택성이 나쁜 경우 (거의 전체 데이터)
+- 복잡한 서브쿼리로 인한 실행계획 불안정
+
+🔧 JPPD 튜닝 체크리스트:
+1. 실행계획에서 "PUSHED PREDICATE" 확인
+2. 인라인뷰 Cardinality(A-Rows) 감소 확인
+3. Hash Group By 메모리 사용량 비교
+4. 전체 실행시간 및 논리적 I/O 비교
+5. PGA 사용량 모니터링 (v$sesstat)
+
+📊 성능 측정 지표:
+- 인라인뷰 처리 Row 수 (A-Rows)
+- Hash Group By 시간/메모리
+- 전체 Consistent Gets
+- PGA 최대 사용량
+*/
+
+-- JPPD 효과 정량 측정
+PROMPT  
+PROMPT === JPPD 정량 효과 측정 ===
+
+-- 처리 데이터량 비교 (인라인뷰별)
+WITH no_jppd_stats AS (
+    -- 전체 고객 대상 집계 후 필터링
+    SELECT COUNT(DISTINCT cust_id) AS processed_custs
+    FROM T_ORDER 
+    WHERE status = 'COMPLETE'
+), jppd_stats AS (
+    -- 특정 지역 고객만 집계 (JPPD 시뮬레이션)
+    SELECT COUNT(DISTINCT o.cust_id) AS processed_custs
+    FROM T_ORDER o, T_CUSTOMER c
+    WHERE o.cust_id = c.cust_id
+      AND o.status = 'COMPLETE'
+      AND c.region = 'R01'
+)
+SELECT 
+    nj.processed_custs AS JPPD없음_처리고객수,
+    js.processed_custs AS JPPD적용_처리고객수,
+    ROUND((nj.processed_custs - js.processed_custs) * 100.0 / nj.processed_custs, 2) AS 감소율_PCT
+FROM no_jppd_stats nj, jppd_stats js;
+
+-- 결과 동일성 검증
+PROMPT
+PROMPT === 결과 동일성 검증 ===
+
+WITH before_jppd AS (
+    SELECT /*+ NO_PUSH_PRED */ COUNT(*) AS cnt, SUM(order_stats.총주문금액) AS sum_amt
+    FROM T_CUSTOMER c,
+         (SELECT cust_id, SUM(total_amount) AS 총주문금액
+          FROM T_ORDER WHERE status = 'COMPLETE' GROUP BY cust_id) order_stats
+    WHERE c.cust_id = order_stats.cust_id AND c.region = :B_REGION AND c.grade = :B_GRADE
+), after_jppd AS (
+    SELECT /*+ PUSH_PRED */ COUNT(*) AS cnt, SUM(order_stats.총주문금액) AS sum_amt  
+    FROM T_CUSTOMER c,
+         (SELECT o.cust_id, SUM(o.total_amount) AS 총주문금액
+          FROM T_ORDER o WHERE o.status = 'COMPLETE' GROUP BY o.cust_id) order_stats
+    WHERE c.cust_id = order_stats.cust_id AND c.region = :B_REGION AND c.grade = :B_GRADE
+)
+SELECT 
+    bj.cnt AS JPPD전_건수, aj.cnt AS JPPD후_건수,
+    bj.sum_amt AS JPPD전_금액합계, aj.sum_amt AS JPPD후_금액합계,
+    CASE WHEN bj.cnt = aj.cnt AND NVL(bj.sum_amt,0) = NVL(aj.sum_amt,0)
+         THEN 'PASS' ELSE 'FAIL' END AS 검증결과
+FROM before_jppd bj, after_jppd aj;
 
 SET AUTOTRACE OFF
 PROMPT
-PROMPT *** Case 04 JPPD 활용 실습 완료 ***
-PROMPT *** 실행계획에서 'UNION ALL PUSHED PREDICATE' 확인하세요! ***
+PROMPT *** Case 04 JPPD (Join Predicate Push Down) 실습 완료 ***
+PROMPT *** 다음: case_05.sql (JOIN → 스칼라 서브쿼리) ***

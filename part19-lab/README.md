@@ -7,8 +7,32 @@ ssh oracle@192.168.50.21
 source ~/.bash_profile
 sqlplus / as sysdba
 
+-- 1. 공통 데이터 세트 생성 (최초 1회, 약 10~15분)
+@/root/.openclaw/workspace/oracle-sql-tuning-compass/part19-lab/setup_data.sql
+
+-- 2. 사례별 실습 (순서 자유)
 @/root/.openclaw/workspace/oracle-sql-tuning-compass/part19-lab/case_01.sql
+
+-- 3. 실습 종료 후 정리
+@/root/.openclaw/workspace/oracle-sql-tuning-compass/part19-lab/cleanup.sql
 ```
+
+## 데이터 세트
+
+| 테이블 | 건수 | 설명 |
+|--------|------|------|
+| T_CUSTOMER | 10만 | 고객 (VIP 5%) |
+| T_ORDER | 100만 | 주문 헤더 |
+| T_ORDER_DETAIL | 500만 | 주문 상세 |
+| T_PRODUCT | 5만 | 상품 |
+| T_CATEGORY | 50 | 카테고리 (PREMIUM 10%) |
+| T_CODE | 200 | 공통코드 |
+| T_STORE | 1,000 | 매장 |
+| T_LOG | 200만 | 시스템로그 |
+| T_BOARD | 50만 | 게시판 |
+| T_DEPT | 100 | 부서 |
+| T_STATUS | 20 | 상태코드 |
+| T_DAILY_SALES | 300만 | 일별매출 |
 
 ## 사례 ↔ 튜닝 기법 매핑
 

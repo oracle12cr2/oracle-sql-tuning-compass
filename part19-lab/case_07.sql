@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Case 07: 실행 계획 분리 (OPTIONAL 바인드 변수 대응)
 -- 핵심 튜닝 기법: UNION ALL로 실행 계획 분리하여 INDEX 효율성 확보
--- 관련 단원: 실행 계획 분리
+-- 관련 단원: 실행계획 분리
+-- 공통 데이터 세트: T_LOG 테이블 사용  
 -- =============================================================================
 
 -- 환경 설정
@@ -12,288 +13,290 @@ SET AUTOTRACE ON
 SET LINESIZE 200
 SET PAGESIZE 50
 
--- 정리 (재실행 시)
-DROP TABLE 경영체등록내역 CASCADE CONSTRAINTS PURGE;
-DROP TABLE 경영체종사원등록내역 CASCADE CONSTRAINTS PURGE;
+-- 공통 데이터 세트 확인
+SELECT '데이터 확인' AS 구분, COUNT(*) AS T_LOG_건수 FROM T_LOG;
 
 PROMPT
 PROMPT ========================================
-PROMPT 1. 테스트 테이블 및 데이터 생성
-PROMPT ========================================
-
--- 경영체등록내역 테이블 생성
-CREATE TABLE 경영체등록내역 AS
-SELECT 
-    'FARM' || LPAD(rownum, 10, '0') AS 경영체등록번호,
-    'R' || LPAD(MOD(rownum-1, 50000) + 1, 13, '0') AS 경영주실명번호,
-    '농장주' || rownum AS 경영주명,
-    TO_CHAR(SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 1800)), 'YYYYMMDD') AS 등록일자,
-    CASE MOD(rownum, 5) WHEN 0 THEN '1' ELSE '0' END AS 삭제여부,  -- 삭제 20%
-    CASE MOD(rownum, 3) 
-        WHEN 0 THEN '개인'
-        WHEN 1 THEN '법인'
-        ELSE '단체'
-    END AS 경영체유형
-FROM dual 
-CONNECT BY level <= 200000;
-
--- 경영체종사원등록내역 테이블 생성
-CREATE TABLE 경영체종사원등록내역 AS
-SELECT 
-    'FARM' || LPAD(MOD(rownum-1, 200000) + 1, 10, '0') AS 경영체등록번호,
-    rownum AS 종사원순번,
-    'EMP' || LPAD(rownum, 10, '0') AS 종사원번호,
-    '종사원' || rownum AS 종사원명,
-    CASE MOD(rownum, 8) WHEN 0 THEN '1' ELSE '0' END AS 삭제여부,  -- 삭제 12.5%
-    TO_CHAR(SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 365)), 'YYYYMMDD') AS 등록일자
-FROM dual
-CONNECT BY level <= 800000;
-
--- PK 및 INDEX 생성
-ALTER TABLE 경영체등록내역 ADD CONSTRAINT PK_경영체등록내역 PRIMARY KEY (경영체등록번호);
-ALTER TABLE 경영체종사원등록내역 ADD CONSTRAINT PK_경영체종사원등록내역 PRIMARY KEY (경영체등록번호, 종사원순번);
-
--- 필요한 INDEX 생성 (OPTIONAL 조건을 위한 INDEX)
-CREATE INDEX IDX_경영체등록내역_01 ON 경영체등록내역 (삭제여부, 경영체등록번호);  -- 경영체등록번호 조건용
-CREATE INDEX IDX_경영체등록내역_02 ON 경영체등록내역 (삭제여부, 경영주실명번호);  -- 경영주실명번호 조건용
-CREATE INDEX IDX_경영체종사원등록내역_01 ON 경영체종사원등록내역 (삭제여부, 경영체등록번호);
-
--- 통계 정보 수집
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '경영체등록내역');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '경영체종사원등록내역');
-
--- 테이블 크기 및 삭제여부 분포 확인
-SELECT table_name 테이블명, num_rows 건수 FROM user_tables 
-WHERE table_name IN ('경영체등록내역', '경영체종사원등록내역');
-
-SELECT '경영체등록내역' 테이블, 삭제여부, COUNT(*) 건수
-FROM 경영체등록내역 GROUP BY 삭제여부
-UNION ALL
-SELECT '경영체종사원등록내역' 테이블, 삭제여부, COUNT(*) 건수
-FROM 경영체종사원등록내역 GROUP BY 삭제여부;
-
-PROMPT
-PROMPT ========================================
-PROMPT 2. 튜닝 전 SQL 및 실행계획 (OPTIONAL 바인드)
-PROMPT ========================================
-
--- 바인드 변수 설정 (OPTIONAL - NULL 가능)
-VARIABLE B1 VARCHAR2(20);  -- 경영주실명번호1
-VARIABLE B2 VARCHAR2(20);  -- 경영주실명번호2  
-VARIABLE B3 VARCHAR2(20);  -- 경영주명
-VARIABLE B4 VARCHAR2(20);  -- 경영체등록번호
-
--- 시나리오 1: 경영체등록번호로 조회
-EXEC :B1 := NULL;
-EXEC :B2 := NULL; 
-EXEC :B3 := NULL;
-EXEC :B4 := 'FARM0000001000';
-
--- 튜닝 전 SQL (DECODE/NVL 사용으로 INDEX 비효율)
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B  
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND A.경영체등록번호 = NVL(:B4, A.경영체등록번호)  -- OPTIONAL 조건
-  AND A.경영주실명번호 = DECODE(:B1, NULL, A.경영주실명번호, :B1)  -- OPTIONAL 조건
-  AND A.경영주실명번호 = DECODE(:B2, NULL, A.경영주실명번호, :B2)  -- OPTIONAL 조건  
-  AND A.경영주명 LIKE DECODE(:B3, NULL, '%', '%' || :B3 || '%');  -- OPTIONAL 조건
-
-PROMPT
-PROMPT ========================================
-PROMPT 3. 튜닝 후 SQL 및 실행계획 (실행 계획 분리)
-PROMPT ========================================
-
--- 튜닝 후 SQL (UNION ALL로 실행 계획 분리)
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NOT NULL 
-  AND A.경영체등록번호 = :B4
-
-UNION ALL
-
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NULL
-  AND (:B1 IS NOT NULL OR :B2 IS NOT NULL)
-  AND A.경영주실명번호 IN (:B1, :B2);
-
-PROMPT
-PROMPT ========================================
-PROMPT 4. 시나리오별 테스트
-PROMPT ========================================
-
--- 시나리오 2: 경영주실명번호로 조회
-EXEC :B1 := 'R0000000010000';
-EXEC :B2 := NULL; 
-EXEC :B3 := NULL;
-EXEC :B4 := NULL;
-
-PROMPT
-PROMPT "=== 경영주실명번호 조회 시나리오 ==="
-
--- 실행 계획 분리된 SQL로 재실행
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NOT NULL 
-  AND A.경영체등록번호 = :B4
-
-UNION ALL
-
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NULL
-  AND (:B1 IS NOT NULL OR :B2 IS NOT NULL)
-  AND A.경영주실명번호 IN (:B1, :B2);
-
-PROMPT
-PROMPT ========================================
-PROMPT 5. 추가 최적화 - 더 세분화된 분리
-PROMPT ========================================
-
--- 시나리오 3: 모든 조건을 세분화
-EXEC :B1 := NULL;
-EXEC :B2 := NULL; 
-EXEC :B3 := '농장주1';
-EXEC :B4 := NULL;
-
--- 완전한 실행 계획 분리 (각 조건별로 최적 INDEX 사용)
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명,
-    '경영체등록번호조회' AS 조회구분
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NOT NULL 
-  AND A.경영체등록번호 = :B4
-
-UNION ALL
-
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명,
-    '실명번호조회' AS 조회구분
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NULL
-  AND (:B1 IS NOT NULL OR :B2 IS NOT NULL)
-  AND A.경영주실명번호 IN (:B1, :B2)
-
-UNION ALL
-
-SELECT 
-    A.경영체등록번호, A.경영주실명번호, A.경영주명,
-    A.등록일자, B.종사원번호, B.종사원명,
-    '경영주명조회' AS 조회구분
-FROM 경영체등록내역 A,
-     경영체종사원등록내역 B
-WHERE A.삭제여부 = '0' 
-  AND B.삭제여부 = '0'
-  AND A.경영체등록번호 = B.경영체등록번호
-  AND :B4 IS NULL
-  AND :B1 IS NULL 
-  AND :B2 IS NULL
-  AND :B3 IS NOT NULL
-  AND A.경영주명 LIKE '%' || :B3 || '%';
-
-PROMPT
-PROMPT ========================================
-PROMPT 6. 성능 분석 및 튜닝 포인트
+PROMPT 1. 실행 계획 분리 시나리오 설명
 PROMPT ========================================
 
 /*
- 핵심 튜닝 포인트 분석:
- 
- 1. 문제점:
-    - OPTIONAL 바인드 변수: 값이 있을 수도 없을 수도 있음
-    - DECODE, NVL 함수 사용으로 INDEX 사용 불가
-    - 옵티마이저가 최적의 실행계획 선택 불가
-    - 모든 경우를 고려한 일반적 계획으로 FULL TABLE SCAN 발생
- 
- 2. OPTIONAL 바인드 변수 문제:
-    - 실행 시점에 조건이 결정됨
-    - 컴파일 시점에 최적 INDEX 선택 불가
-    - 함수 사용으로 INDEX 조건 활용 불가
- 
- 3. 실행 계획 분리 원리:
-    - 각 시나리오별로 별도의 실행계획 생성
-    - 조건에 따라 최적의 INDEX 사용 가능
-    - UNION ALL로 결합하여 동일 결과 보장
- 
- 4. 분리 조건 설계:
-    - 상호배타적 조건으로 분리 (AND 연산자)
-    - NULL 체크를 이용한 조건 분기
-    - 각 분기별 최적 INDEX 존재 확인
- 
- 5. 튜닝 방법:
-    - 주요 조회 패턴별로 UNION ALL 분기 생성
-    - IS NULL, IS NOT NULL로 조건 분리
-    - 각 분기에 적절한 힌트 적용
- 
- 6. 주의 사항:
-    - UNION ALL 분기가 너무 많으면 관리 복잡
-    - 중복 데이터 방지 위한 상호배타적 조건 필수
-    - 실행 계획 확인 필수 (원하는 INDEX 사용 여부)
- 
- 7. 적용 효과:
-    - FULL TABLE SCAN → INDEX RANGE SCAN
-    - 조회 패턴별 최적 성능
-    - 애플리케이션 수정 최소화
+실행 계획 분리 개념:
+- Optional 조건이 있는 SQL에서 각 경우별로 최적 실행계획 수립
+- UNION ALL을 사용하여 조건별로 다른 INDEX 활용
+- 바인드 변수 Peeking 문제 해결
+
+시나리오: 시스템 로그 조회 (조건별 최적화 필요)
+- 필수 조건: 날짜 범위
+- 선택 조건1: category (CPU/IO/MEM) - 값이 있으면 매우 선택적
+- 선택 조건2: status - 값이 있으면 필터 효과 높음
+
+문제점: 하나의 SQL로 모든 경우를 커버하면 어정쩡한 실행계획
+해결책: 조건별로 SQL 분리하여 각각 최적 INDEX 활용
 */
 
-PROMPT
+PROMPT  
 PROMPT ========================================
-PROMPT 7. INDEX 사용 현황 분석
+PROMPT 2. 데이터 분포 및 INDEX 효율성 분석
 PROMPT ========================================
 
--- 각 시나리오별 INDEX 선택도 확인
-SELECT 'IDX_경영체등록내역_01 (경영체등록번호)' INDEX명,
-       COUNT(*) 전체건수,
-       COUNT(CASE WHEN 삭제여부='0' THEN 1 END) 유효건수,
-       ROUND(COUNT(CASE WHEN 삭제여부='0' THEN 1 END) / COUNT(*) * 100, 2) AS 선택도
-FROM 경영체등록내역
+-- 컬럼별 분포 확인 (INDEX 선택성 판단)
+SELECT 'category' AS 컬럼명, category AS 값, COUNT(*) AS 건수,
+       ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM T_LOG), 2) AS 비율_PCT
+FROM T_LOG GROUP BY category
 UNION ALL
-SELECT 'IDX_경영체등록내역_02 (경영주실명번호)',
-       COUNT(*),
-       COUNT(CASE WHEN 삭제여부='0' THEN 1 END),
-       ROUND(COUNT(CASE WHEN 삭제여부='0' THEN 1 END) / COUNT(*) * 100, 2)
-FROM 경영체등록내역;
+SELECT 'status', status, COUNT(*),
+       ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM T_LOG), 2)
+FROM T_LOG GROUP BY status  
+ORDER BY 1, 4 DESC;
+
+-- INDEX 정보 확인
+SELECT index_name, column_name, column_position
+FROM user_ind_columns
+WHERE table_name = 'T_LOG'
+  AND index_name IN ('IDX_LOG_01', 'IDX_LOG_02')
+ORDER BY index_name, column_position;
+
+-- 날짜별 분포 확인
+SELECT TO_CHAR(log_date, 'YYYY-MM') AS 년월, COUNT(*) AS 건수
+FROM T_LOG
+GROUP BY TO_CHAR(log_date, 'YYYY-MM')
+ORDER BY 1;
+
+PROMPT
+PROMPT ========================================
+PROMPT 3. 튜닝 전 SQL 및 실행계획 (단일 SQL)
+PROMPT ========================================
+
+-- 바인드 변수 설정
+VARIABLE B_START_DATE DATE;
+VARIABLE B_END_DATE DATE;
+VARIABLE B_CATEGORY VARCHAR2(20);
+VARIABLE B_STATUS VARCHAR2(20);
+EXEC :B_START_DATE := DATE '2024-06-01';
+EXEC :B_END_DATE := DATE '2024-06-30';
+EXEC :B_CATEGORY := 'CPU';  -- 때로는 NULL
+EXEC :B_STATUS := NULL;     -- 때로는 'ERROR'
+
+-- 튜닝 전 SQL (하나의 SQL로 모든 케이스 처리)
+-- Optional 조건으로 인한 실행계획 불안정
+SELECT 
+    log_id,
+    log_date,
+    category,
+    value,
+    session_id,
+    status
+FROM T_LOG
+WHERE log_date BETWEEN :B_START_DATE AND :B_END_DATE
+  AND (:B_CATEGORY IS NULL OR category = :B_CATEGORY)
+  AND (:B_STATUS IS NULL OR status = :B_STATUS)
+  AND value > 50
+ORDER BY log_date DESC, log_id;
+
+PROMPT
+PROMPT ========================================
+PROMPT 4. 튜닝 후 SQL 및 실행계획 (UNION ALL 분리)
+PROMPT ========================================
+
+-- 튜닝 후 SQL (조건별 실행계획 분리)
+-- 각 경우별로 최적 INDEX 활용
+SELECT * FROM (
+    -- Case 1: category 조건 있음, status 조건 없음
+    SELECT /*+ INDEX(t IDX_LOG_01) */
+        log_id, log_date, category, value, session_id, status, '1' as case_type
+    FROM T_LOG t
+    WHERE :B_CATEGORY IS NOT NULL AND :B_STATUS IS NULL
+      AND log_date BETWEEN :B_START_DATE AND :B_END_DATE
+      AND category = :B_CATEGORY
+      AND value > 50
+    
+    UNION ALL
+    
+    -- Case 2: category 조건 없음, status 조건 있음  
+    SELECT /*+ INDEX(t IDX_LOG_02) */
+        log_id, log_date, category, value, session_id, status, '2'
+    FROM T_LOG t  
+    WHERE :B_CATEGORY IS NULL AND :B_STATUS IS NOT NULL
+      AND log_date BETWEEN :B_START_DATE AND :B_END_DATE
+      AND status = :B_STATUS
+      AND value > 50
+    
+    UNION ALL
+    
+    -- Case 3: 둘 다 있음
+    SELECT /*+ INDEX(t IDX_LOG_01) */
+        log_id, log_date, category, value, session_id, status, '3'
+    FROM T_LOG t
+    WHERE :B_CATEGORY IS NOT NULL AND :B_STATUS IS NOT NULL  
+      AND log_date BETWEEN :B_START_DATE AND :B_END_DATE
+      AND category = :B_CATEGORY
+      AND status = :B_STATUS
+      AND value > 50
+    
+    UNION ALL
+    
+    -- Case 4: 둘 다 없음 (날짜 조건만)
+    SELECT /*+ INDEX(t IDX_LOG_02) */
+        log_id, log_date, category, value, session_id, status, '4'
+    FROM T_LOG t
+    WHERE :B_CATEGORY IS NULL AND :B_STATUS IS NULL
+      AND log_date BETWEEN :B_START_DATE AND :B_END_DATE  
+      AND value > 50
+)
+ORDER BY log_date DESC, log_id;
+
+PROMPT
+PROMPT ========================================
+PROMPT 5. 실행 계획 분리 상세 분석
+PROMPT ========================================
+
+/*
+핵심 튜닝 포인트 분석:
+
+1. Optional 조건 문제점:
+   - OR 조건, IS NULL 체크로 인한 INDEX 비효율
+   - 바인드 변수 Peeking으로 고정된 실행계획
+   - 조건별 최적 INDEX 사용 불가
+
+2. UNION ALL 분리 장점:
+   - 각 케이스별 전용 실행계획 수립
+   - 최적 INDEX 선택 (category → IDX_LOG_01, 날짜만 → IDX_LOG_02)
+   - 불필요한 FILTER Operation 제거
+
+3. 분리 기준:
+   - 선택성이 크게 다른 조건들
+   - INDEX 활용도가 다른 경우
+   - 바인드 변수 값에 따라 성능 차이가 큰 경우
+
+4. UNION ALL 주의사항:
+   - 중복 데이터 발생 방지 (상호 배타적 조건 필수)
+   - 너무 많은 분기는 코드 복잡성 증가
+   - 유지보수 비용 고려
+
+5. 성과:
+   - 각 시나리오별 최적 INDEX 활용
+   - 일관된 성능 보장
+   - 바인드 변수 Peeking 문제 해결
+*/
+
+-- 각 케이스별 성능 비교
+PROMPT
+PROMPT === 케이스별 성능 비교 ===
+
+-- Case 1: category 조건만 (선택성 높음)
+EXEC :B_CATEGORY := 'CPU'; :B_STATUS := NULL;
+
+SELECT COUNT(*), AVG(value)
+FROM T_LOG
+WHERE log_date BETWEEN DATE '2024-06-01' AND DATE '2024-06-30'
+  AND category = :B_CATEGORY  
+  AND value > 50;
+
+-- Case 2: status 조건만 (선택성 보통) 
+EXEC :B_CATEGORY := NULL; :B_STATUS := 'ERROR';
+
+SELECT COUNT(*), AVG(value)
+FROM T_LOG  
+WHERE log_date BETWEEN DATE '2024-06-01' AND DATE '2024-06-30'
+  AND status = :B_STATUS
+  AND value > 50;
+
+-- Case 3: 둘 다 (매우 선택적)
+EXEC :B_CATEGORY := 'CPU'; :B_STATUS := 'ERROR';
+
+SELECT COUNT(*), AVG(value)
+FROM T_LOG
+WHERE log_date BETWEEN DATE '2024-06-01' AND DATE '2024-06-30'
+  AND category = :B_CATEGORY
+  AND status = :B_STATUS
+  AND value > 50;
+
+PROMPT
+PROMPT ========================================
+PROMPT 6. 실무 적용 가이드
+PROMPT ========================================
+
+/*
+실행 계획 분리 실무 가이드:
+
+✅ 적용 권장 상황:
+- Optional 매개변수가 있는 공통 함수/프로시저
+- 조건별 선택성 차이가 10배 이상
+- 바인드 변수 값에 따른 성능 편차 심함
+- 사용 패턴이 명확하게 구분되는 경우
+
+❌ 적용 비권장 상황:
+- 분기 조건이 너무 많은 경우 (>5개)
+- 각 케이스 간 성능 차이가 미미한 경우
+- 코드 복잡성 대비 성능 이득이 적은 경우
+
+🔧 설계 가이드:
+1. 상호 배타적 조건으로 중복 방지
+2. 각 분기별 최적 INDEX 힌트 지정
+3. 공통 부분은 함수/뷰로 분리
+4. 실행 통계 모니터링으로 효과 검증
+
+📊 성능 측정:
+- 케이스별 실행시간 편차 확인
+- INDEX 사용률 비교 (v$sql_plan)  
+- Consistent Gets 감소량
+- 사용자 응답시간 개선도
+
+💡 Alternative 기법:
+- Dynamic SQL (PL/SQL)
+- Function-based Index
+- Partitioning 활용
+- Materialized View
+*/
+
+-- 실행계획 분리 효과 검증
+PROMPT
+PROMPT === 실행계획 분리 효과 검증 ===
+
+-- 단일 SQL vs 분리 SQL 성능 비교
+WITH single_sql AS (
+    -- 단일 SQL (category만 조건)
+    SELECT COUNT(*) AS cnt
+    FROM T_LOG
+    WHERE log_date >= DATE '2024-06-01' 
+      AND log_date < DATE '2024-07-01'
+      AND ('CPU' IS NULL OR category = 'CPU')
+      AND value > 50
+), split_sql AS (
+    -- 분리 SQL 시뮬레이션
+    SELECT COUNT(*) AS cnt  
+    FROM T_LOG
+    WHERE log_date >= DATE '2024-06-01'
+      AND log_date < DATE '2024-07-01'  
+      AND category = 'CPU'
+      AND value > 50
+)
+SELECT 
+    ss.cnt AS 단일SQL_결과,
+    sp.cnt AS 분리SQL_결과,
+    CASE WHEN ss.cnt = sp.cnt THEN 'PASS' ELSE 'FAIL' END AS 검증결과
+FROM single_sql ss, split_sql sp;
+
+-- 조건별 데이터 분포 (분리 기준 검증)
+SELECT 
+    CASE WHEN category = 'CPU' AND status = 'ERROR' THEN 'CPU+ERROR'
+         WHEN category = 'CPU' THEN 'CPU만'
+         WHEN status = 'ERROR' THEN 'ERROR만'  
+         ELSE '기타' END AS 조건조합,
+    COUNT(*) AS 건수,
+    ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM T_LOG WHERE log_date >= DATE '2024-01-01'), 2) AS 비율_PCT
+FROM T_LOG  
+WHERE log_date >= DATE '2024-01-01'
+GROUP BY 
+    CASE WHEN category = 'CPU' AND status = 'ERROR' THEN 'CPU+ERROR'
+         WHEN category = 'CPU' THEN 'CPU만'
+         WHEN status = 'ERROR' THEN 'ERROR만'
+         ELSE '기타' END
+ORDER BY COUNT(*) DESC;
 
 SET AUTOTRACE OFF
-PROMPT
+PROMPT  
 PROMPT *** Case 07 실행 계획 분리 실습 완료 ***
-PROMPT *** 바인드 변수 시나리오별로 다른 INDEX 사용 확인하세요! ***
+PROMPT *** 다음: case_08.sql (JOIN 순서 + 스칼라 서브쿼리) ***

@@ -1,7 +1,8 @@
 -- =============================================================================
--- Case 03: NL JOIN → HASH JOIN 변경
+-- Case 03: NL JOIN → HASH JOIN 변경  
 -- 핵심 튜닝 기법: 대량 건수 NL JOIN을 HASH JOIN으로 변경하여 I/O 최적화
 -- 관련 단원: JOIN 최적화
+-- 공통 데이터 세트: T_ORDER + T_ORDER_DETAIL 테이블 사용
 -- =============================================================================
 
 -- 환경 설정
@@ -12,213 +13,286 @@ SET AUTOTRACE ON
 SET LINESIZE 200
 SET PAGESIZE 50
 
--- 정리 (재실행 시)
-DROP TABLE 접수처리기본 CASCADE CONSTRAINTS PURGE;
-DROP TABLE 신청기본 CASCADE CONSTRAINTS PURGE;
-DROP TABLE 여신고객기본 CASCADE CONSTRAINTS PURGE;
-DROP TABLE 개인사업자내역 CASCADE CONSTRAINTS PURGE;
+-- 공통 데이터 세트 확인
+SELECT '데이터 확인' AS 구분,
+       (SELECT COUNT(*) FROM T_ORDER) AS ORDER_건수,
+       (SELECT COUNT(*) FROM T_ORDER_DETAIL) AS ORDER_DETAIL_건수
+FROM DUAL;
 
 PROMPT
 PROMPT ========================================
-PROMPT 1. 테스트 테이블 및 데이터 생성
-PROMPT ========================================
-
--- 접수처리기본 테이블 생성 (42만 건)
-CREATE TABLE 접수처리기본 AS
-SELECT 
-    rownum AS 여신심사접수번호,
-    MOD(rownum-1, 1000) + 1 AS 여신심사접수일련번호,
-    TO_CHAR(SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 365)), 'YYYYMMDD') AS 여신신청일자,
-    TO_CHAR(SYSDATE - TRUNC(DBMS_RANDOM.VALUE(1, 30)), 'YYYYMMDD') AS 처리일자,
-    CASE MOD(rownum, 5)
-        WHEN 0 THEN 'E42'
-        WHEN 1 THEN 'E43' 
-        WHEN 2 THEN 'E98'
-        WHEN 3 THEN 'E99'
-        ELSE 'E01'
-    END AS 여신심사진행상태코드,
-    'BC' || LPAD(MOD(rownum-1, 50000) + 1, 8, '0') AS 기업여신상담번호,
-    CASE MOD(rownum, 2) WHEN 0 THEN '1' ELSE '5' END AS 중앙회조합구분코드
-FROM dual 
-CONNECT BY level <= 100000;  -- 10만건으로 축소 (시연용)
-
--- 신청기본 테이블 생성 (소형)
-CREATE TABLE 신청기본 AS
-SELECT DISTINCT
-    기업여신상담번호,
-    MOD(rownum, 10) AS 투자금융유형코드,
-    '신용대출' AS 대출종류
-FROM 접수처리기본
-WHERE rownum <= 5000;
-
--- 여신고객기본 테이블 생성
-CREATE TABLE 여신고객기본 AS
-SELECT 
-    여신심사접수번호,
-    여신심사접수일련번호,
-    'R' || LPAD(여신심사접수번호, 10, '0') AS 실명번호,
-    '개인' AS 고객유형
-FROM 접수처리기본;
-
--- 개인사업자내역 테이블 생성 (소형)
-CREATE TABLE 개인사업자내역 AS
-SELECT 
-    'R' || LPAD(rownum, 10, '0') AS 신용조사기업식별번호,
-    CASE MOD(rownum, 2) WHEN 0 THEN 'Y' ELSE 'N' END AS 소매여부
-FROM dual
-CONNECT BY level <= 20000;
-
--- PK 및 INDEX 생성
-ALTER TABLE 접수처리기본 ADD CONSTRAINT PK_접수처리기본 PRIMARY KEY (여신심사접수번호, 여신심사접수일련번호);
-ALTER TABLE 신청기본 ADD CONSTRAINT PK_신청기본 PRIMARY KEY (기업여신상담번호);
-ALTER TABLE 여신고객기본 ADD CONSTRAINT PK_여신고객기본 PRIMARY KEY (여신심사접수번호, 여신심사접수일련번호);
-ALTER TABLE 개인사업자내역 ADD CONSTRAINT PK_개인사업자내역 PRIMARY KEY (신용조사기업식별번호);
-
--- 통계 정보 수집
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '접수처리기본');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '신청기본');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '여신고객기본');
-EXEC DBMS_STATS.GATHER_TABLE_STATS(user, '개인사업자내역');
-
--- 테이블 크기 확인
-SELECT 'TABLE' 구분, table_name 테이블명, num_rows 건수, 
-       ROUND(num_rows * avg_row_len / 1024 / 1024, 2) AS 예상크기_MB
-FROM user_tables 
-WHERE table_name IN ('접수처리기본', '신청기본', '여신고객기본', '개인사업자내역')
-ORDER BY num_rows DESC;
-
-PROMPT
-PROMPT ========================================
-PROMPT 2. 튜닝 전 SQL 및 실행계획 (NL JOIN)
-PROMPT ========================================
-
--- 바인드 변수 설정
-VARIABLE B0 VARCHAR2(8);
-EXEC :B0 := TO_CHAR(SYSDATE, 'YYYYMMDD');
-
--- 튜닝 전 SQL (기본적으로 NL JOIN 실행)
-SELECT 
-    T1.여신심사접수번호, T1.여신심사접수일련번호,
-    T1.여신신청일자, T1.처리일자, T1.실명번호,
-    T2.소매여부, T2.신용조사기업식별번호
-FROM (
-    SELECT 
-        A.여신심사접수번호, A.여신심사접수일련번호,
-        A.여신신청일자, A.처리일자, C.실명번호,
-        NVL(B.투자금융유형코드, 0) 투자금융유형코드
-    FROM 접수처리기본 A, 신청기본 B, 여신고객기본 C
-    WHERE A.여신심사진행상태코드 IN ('E42', 'E43', 'E98', 'E99')
-      AND A.기업여신상담번호 = B.기업여신상담번호(+)
-      AND A.여신심사접수번호 = C.여신심사접수번호
-      AND A.여신심사접수일련번호 = C.여신심사접수일련번호
-      AND A.처리일자 <= :B0
-      AND A.중앙회조합구분코드 IN ('1', '5')
-) T1, 개인사업자내역 T2
-WHERE T1.실명번호 = T2.신용조사기업식별번호(+);
-
-PROMPT
-PROMPT ========================================
-PROMPT 3. 튜닝 후 SQL 및 실행계획 (HASH JOIN)
-PROMPT ========================================
-
--- 튜닝 후 SQL (USE_HASH 힌트로 HASH JOIN 강제)
-SELECT /*+ USE_HASH(T1 T2) */
-    T1.여신심사접수번호, T1.여신심사접수일련번호,
-    T1.여신신청일자, T1.처리일자, T1.실명번호,
-    T2.소매여부, T2.신용조사기업식별번호
-FROM (
-    SELECT /*+ USE_HASH(A B C) FULL(A) FULL(B) FULL(C) */
-        A.여신심사접수번호, A.여신심사접수일련번호,
-        A.여신신청일자, A.처리일자, C.실명번호,
-        NVL(B.투자금융유형코드, 0) 투자금융유형코드
-    FROM 접수처리기본 A, 신청기본 B, 여신고객기본 C
-    WHERE A.여신심사진행상태코드 IN ('E42', 'E43', 'E98', 'E99')
-      AND A.기업여신상담번호 = B.기업여신상담번호(+)
-      AND A.여신심사접수번호 = C.여신심사접수번호
-      AND A.여신심사접수일련번호 = C.여신심사접수일련번호
-      AND A.처리일자 <= :B0
-      AND A.중앙회조합구분코드 IN ('1', '5')
-) T1, 개인사업자내역 T2
-WHERE T1.실명번호 = T2.신용조사기업식별번호(+);
-
-PROMPT
-PROMPT ========================================
-PROMPT 4. JOIN 방법별 성능 비교
-PROMPT ========================================
-
--- NL JOIN vs HASH JOIN 성능 차이 확인
--- 실행계획에서 다음 항목들을 비교:
--- 1. Starts 컬럼 (NL JOIN에서는 높은 값, HASH JOIN에서는 낮은 값)
--- 2. Buffers 총합
--- 3. A-Time (실제 소요 시간)
--- 4. Used-Mem (PGA 메모리 사용량)
-
-PROMPT
-PROMPT ========================================
-PROMPT 5. 성능 분석 및 튜닝 포인트
+PROMPT 1. NL vs HASH JOIN 시나리오 설명
 PROMPT ========================================
 
 /*
- 핵심 튜닝 포인트 분석:
- 
- 1. 문제점:
-    - 접수처리기본에서 많은 건수(42만건) 추출
-    - 각 건에 대해 후행 테이블과 NL JOIN 발생
-    - Random Single Block I/O 대량 발생 (Starts 통계 확인)
-    - JOIN되는 테이블들의 크기는 상대적으로 작음
- 
- 2. 해결책:
-    - HASH JOIN 적용으로 Sequential I/O 활용
-    - FULL TABLE SCAN으로 Multi Block I/O 효율성 확보
-    - Build 테이블을 작은 테이블로 설정
- 
- 3. HASH JOIN 적용 조건:
-    - JOIN되는 테이블 중 하나가 충분히 작아야 함 (Build용)
-    - 많은 건수가 NL JOIN될 때 효과적
-    - PGA 메모리가 충분해야 함
-    - Equal JOIN 조건에서만 사용 가능
- 
- 4. NL JOIN vs HASH JOIN 선택 기준:
-    - 소량 데이터 + INDEX 효율적 → NL JOIN
-    - 대량 데이터 + 작은 테이블 존재 → HASH JOIN
-    - 조건절 선택도가 좋은 경우 → NL JOIN
-    - 조건절 선택도가 나쁜 경우 → HASH JOIN
- 
- 5. 성과:
-    - Buffers: 2,095K → 51,736 (97.5% 개선)
-    - 실행 시간: 1분 7초 → 6.17초 (90.8% 개선)
-    - Starts 수치 대폭 감소 (Random I/O → Sequential I/O)
+시나리오: 주문과 주문상세 대량 JOIN 처리
+테이블: T_ORDER (100만건) + T_ORDER_DETAIL (500만건)
+문제점: NL JOIN 시 Inner 테이블 반복 ACCESS로 I/O 과부하
+해결책: HASH JOIN으로 변경하여 한번에 BUILD & PROBE
+
+JOIN 방법별 특성:
+1) NL JOIN: Outer Row마다 Inner 테이블 INDEX ACCESS (1:M 관계에서 비효율)
+2) HASH JOIN: 작은 테이블을 Hash Table로 만들고 큰 테이블을 Probe
+3) SORT MERGE: 양쪽 테이블 정렬 후 JOIN (이미 정렬된 경우 유리)
 */
 
 PROMPT
-PROMPT ========================================
-PROMPT 6. 추가 검증 - JOIN 건수 분석
+PROMPT ========================================  
+PROMPT 2. JOIN 조건 및 데이터 분포 확인
 PROMPT ========================================
 
--- 각 단계별 JOIN 결과 건수 확인
-SELECT '접수처리기본 조건 후' 단계, COUNT(*) 건수
-FROM 접수처리기본 A
-WHERE A.여신심사진행상태코드 IN ('E42', 'E43', 'E98', 'E99')
-  AND A.처리일자 <= :B0
-  AND A.중앙회조합구분코드 IN ('1', '5')
+-- JOIN 키 분포 확인
+SELECT 'T_ORDER 건수' AS 구분, COUNT(*) AS 값 FROM T_ORDER
 UNION ALL
-SELECT '여신고객기본 JOIN 후', COUNT(*)
-FROM 접수처리기본 A, 여신고객기본 C
-WHERE A.여신심사진행상태코드 IN ('E42', 'E43', 'E98', 'E99')
-  AND A.처리일자 <= :B0
-  AND A.중앙회조합구분코드 IN ('1', '5')
-  AND A.여신심사접수번호 = C.여신심사접수번호
-  AND A.여신심사접수일련번호 = C.여신심사접수일련번호
-UNION ALL  
-SELECT '개인사업자내역 JOIN 후', COUNT(*)
-FROM 접수처리기본 A, 여신고객기본 C, 개인사업자내역 T2
-WHERE A.여신심사진행상태코드 IN ('E42', 'E43', 'E98', 'E99')
-  AND A.처리일자 <= :B0
-  AND A.중앙회조합구분코드 IN ('1', '5')
-  AND A.여신심사접수번호 = C.여신심사접수번호
-  AND A.여신심사접수일련번호 = C.여신심사접수일련번호
-  AND C.실명번호 = T2.신용조사기업식별번호(+);
+SELECT 'T_ORDER_DETAIL 건수', COUNT(*) FROM T_ORDER_DETAIL
+UNION ALL
+SELECT 'JOIN 키 매칭 확인', COUNT(DISTINCT od.order_id) 
+FROM T_ORDER_DETAIL od, T_ORDER o 
+WHERE od.order_id = o.order_id
+AND ROWNUM <= 100000;  -- 샘플링으로 확인
+
+-- 주문당 상세 건수 분포 (JOIN Cardinality)
+SELECT 
+    '1건' AS 상세건수_범위,
+    COUNT(*) AS 주문수
+FROM (
+    SELECT order_id, COUNT(*) AS detail_cnt
+    FROM T_ORDER_DETAIL 
+    WHERE order_id <= 10000  -- 샘플링
+    GROUP BY order_id
+    HAVING COUNT(*) = 1
+)
+UNION ALL
+SELECT '2-5건', COUNT(*)
+FROM (
+    SELECT order_id, COUNT(*) AS detail_cnt  
+    FROM T_ORDER_DETAIL
+    WHERE order_id <= 10000
+    GROUP BY order_id
+    HAVING COUNT(*) BETWEEN 2 AND 5
+)
+UNION ALL
+SELECT '6건이상', COUNT(*)
+FROM (
+    SELECT order_id, COUNT(*) AS detail_cnt
+    FROM T_ORDER_DETAIL  
+    WHERE order_id <= 10000
+    GROUP BY order_id
+    HAVING COUNT(*) >= 6
+);
+
+PROMPT
+PROMPT ========================================
+PROMPT 3. 튜닝 전 SQL 및 실행계획 (NL JOIN)
+PROMPT ========================================
+
+-- 바인드 변수 설정  
+VARIABLE B_START_DATE DATE;
+VARIABLE B_END_DATE DATE;
+VARIABLE B_STATUS VARCHAR2(20);
+EXEC :B_START_DATE := DATE '2024-06-01';
+EXEC :B_END_DATE := DATE '2024-06-30'; 
+EXEC :B_STATUS := 'COMPLETE';
+
+-- 튜닝 전 SQL (NL JOIN 강제 - 비효율)
+-- 대량 데이터에서 NL JOIN은 Inner 테이블 반복 ACCESS 발생
+SELECT /*+ USE_NL(o od) LEADING(o od) */
+    o.order_id,
+    o.cust_id,
+    o.order_date,
+    o.status,
+    COUNT(od.detail_id) AS 상세건수,
+    SUM(od.amount) AS 총주문금액,
+    AVG(od.unit_price) AS 평균단가
+FROM T_ORDER o,
+     T_ORDER_DETAIL od  
+WHERE o.order_id = od.order_id
+  AND o.order_date BETWEEN :B_START_DATE AND :B_END_DATE
+  AND o.status = :B_STATUS
+GROUP BY o.order_id, o.cust_id, o.order_date, o.status
+HAVING SUM(od.amount) > 50000
+ORDER BY 총주문금액 DESC;
+
+PROMPT
+PROMPT ========================================
+PROMPT 4. 튜닝 후 SQL 및 실행계획 (HASH JOIN)
+PROMPT ========================================
+
+-- 튜닝 후 SQL (HASH JOIN 사용)
+-- 대량 JOIN에 최적화된 HASH JOIN으로 I/O 최적화
+SELECT /*+ USE_HASH(o od) LEADING(o od) */
+    o.order_id,
+    o.cust_id,
+    o.order_date, 
+    o.status,
+    COUNT(od.detail_id) AS 상세건수,
+    SUM(od.amount) AS 총주문금액,
+    AVG(od.unit_price) AS 평균단가
+FROM T_ORDER o,
+     T_ORDER_DETAIL od
+WHERE o.order_id = od.order_id
+  AND o.order_date BETWEEN :B_START_DATE AND :B_END_DATE
+  AND o.status = :B_STATUS  
+GROUP BY o.order_id, o.cust_id, o.order_date, o.status
+HAVING SUM(od.amount) > 50000
+ORDER BY 총주문금액 DESC;
+
+PROMPT
+PROMPT ========================================
+PROMPT 5. JOIN 방법 상세 분석
+PROMPT ========================================
+
+/*
+핵심 튜닝 포인트 분석:
+
+1. NL JOIN 문제점:
+   - Outer 테이블(T_ORDER) 각 Row마다 Inner 테이블 INDEX SEEK
+   - T_ORDER 10만 Row → T_ORDER_DETAIL INDEX ACCESS 10만번
+   - 대량 데이터에서 Random I/O 과다 발생
+   - Buffer Cache 효율성 저하
+
+2. HASH JOIN 장점:
+   - 작은 테이블(T_ORDER)을 Hash Table로 BUILD
+   - 큰 테이블(T_ORDER_DETAIL)을 순차 SCAN하며 PROBE
+   - Sequential I/O 위주로 처리
+   - JOIN 키 Hash값으로 빠른 매칭
+
+3. HASH JOIN 적용 조건:
+   - 조인 결과가 전체 데이터의 일정 비율 이상
+   - 한쪽 테이블이 PGA Hash Area에 들어갈 크기
+   - Equi-Join (= 조건)인 경우
+   - 통계 정보가 정확한 경우
+
+4. 힌트 사용법:
+   - USE_HASH(테이블1 테이블2): HASH JOIN 강제
+   - LEADING(테이블1 테이블2): JOIN 순서 지정 (BUILD 테이블 먼저)
+   - PQ_DISTRIBUTE(테이블 BROADCAST): Parallel 환경에서 분산 방법
+
+5. 성과:
+   - Consistent Gets 대폭 감소 (Random → Sequential I/O)
+   - CPU 사용량 증가하나 전체 응답시간 단축
+   - Buffer Pool 효율성 개선
+*/
+
+-- JOIN 방법별 성능 비교
+PROMPT
+PROMPT === JOIN 방법별 성능 비교 ===
+
+-- 1) NL JOIN 강제
+SELECT /*+ USE_NL(o od) LEADING(o od) */ 
+    COUNT(*) AS 결과건수, 
+    SUM(od.amount) AS 총액
+FROM T_ORDER o, T_ORDER_DETAIL od
+WHERE o.order_id = od.order_id  
+  AND o.order_date >= DATE '2024-06-01'
+  AND o.order_date < DATE '2024-07-01'
+  AND o.status = 'COMPLETE';
+
+-- 2) HASH JOIN 강제
+SELECT /*+ USE_HASH(o od) LEADING(o od) */
+    COUNT(*) AS 결과건수,
+    SUM(od.amount) AS 총액  
+FROM T_ORDER o, T_ORDER_DETAIL od
+WHERE o.order_id = od.order_id
+  AND o.order_date >= DATE '2024-06-01' 
+  AND o.order_date < DATE '2024-07-01'
+  AND o.status = 'COMPLETE';
+
+-- 3) 옵티마이저 선택 (힌트 없음)
+SELECT COUNT(*) AS 결과건수, 
+       SUM(od.amount) AS 총액
+FROM T_ORDER o, T_ORDER_DETAIL od
+WHERE o.order_id = od.order_id
+  AND o.order_date >= DATE '2024-06-01'
+  AND o.order_date < DATE '2024-07-01'  
+  AND o.status = 'COMPLETE';
+
+PROMPT
+PROMPT ========================================
+PROMPT 6. 실무 적용 가이드
+PROMPT ========================================
+
+/*
+JOIN 방법 선택 가이드:
+
+🔹 NL JOIN 적용 상황:
+- 조인 결과가 적은 경우 (< 전체 1%)
+- Outer 테이블 조건으로 크게 필터링되는 경우
+- Inner 테이블에 유용한 INDEX가 있는 경우  
+- OLTP 환경의 단건/소량 처리
+
+🔹 HASH JOIN 적용 상황:
+- 대량 데이터 JOIN (조인 결과 > 전체 5%)
+- 양쪽 테이블 모두 범위 조건인 경우
+- Inner 테이블에 적절한 INDEX가 없는 경우
+- 배치/DW 환경의 대량 처리
+
+🔹 SORT MERGE JOIN 적용 상황:
+- 양쪽 테이블이 이미 정렬되어 있는 경우
+- 메모리가 부족해서 HASH JOIN이 어려운 경우
+- 부등호 조인 조건 (>, <, BETWEEN)
+
+❗ 주의사항:
+- PGA 메모리 부족 시 HASH JOIN → Temp Tablespace 사용
+- 통계 정보 부정확 시 잘못된 JOIN 방법 선택
+- Parallel 처리 시 PQ_DISTRIBUTE 고려 필요
+
+🔧 성능 튜닝 체크리스트:
+1. JOIN 키에 INDEX 존재 여부 확인
+2. 조인 Cardinality 확인 (1:1, 1:M, M:M)
+3. 각 테이블의 필터 조건 효율성 확인
+4. 실행계획에서 Rows, Buffers 비교
+5. PGA/Temp 공간 사용량 모니터링
+*/
+
+-- JOIN 효율성 검증
+PROMPT
+PROMPT === JOIN 효율성 검증 ===
+
+-- 실제 JOIN Cardinality 확인
+WITH join_stats AS (
+    SELECT 
+        COUNT(DISTINCT o.order_id) AS distinct_orders,
+        COUNT(DISTINCT od.detail_id) AS distinct_details,
+        COUNT(*) AS total_joins
+    FROM T_ORDER o, T_ORDER_DETAIL od
+    WHERE o.order_id = od.order_id
+      AND o.order_date >= DATE '2024-06-01'
+      AND o.order_date < DATE '2024-07-01' 
+      AND ROWNUM <= 50000  -- 샘플링
+)
+SELECT 
+    distinct_orders AS 조인된_주문수,
+    distinct_details AS 조인된_상세수, 
+    total_joins AS 전체_조인결과,
+    ROUND(total_joins / distinct_orders, 2) AS 주문당_평균상세건수
+FROM join_stats;
+
+-- 결과 동일성 검증
+PROMPT
+PROMPT === 결과 동일성 검증 ===
+
+WITH nl_join AS (
+    SELECT /*+ USE_NL(o od) */ COUNT(*) AS cnt, SUM(od.amount) AS sum_amt
+    FROM T_ORDER o, T_ORDER_DETAIL od
+    WHERE o.order_id = od.order_id
+      AND o.order_date BETWEEN :B_START_DATE AND :B_END_DATE
+      AND o.status = :B_STATUS
+), hash_join AS (
+    SELECT /*+ USE_HASH(o od) */ COUNT(*) AS cnt, SUM(od.amount) AS sum_amt
+    FROM T_ORDER o, T_ORDER_DETAIL od  
+    WHERE o.order_id = od.order_id
+      AND o.order_date BETWEEN :B_START_DATE AND :B_END_DATE
+      AND o.status = :B_STATUS
+)
+SELECT 
+    nl.cnt AS NL_JOIN_건수, hj.cnt AS HASH_JOIN_건수,
+    nl.sum_amt AS NL_JOIN_금액합계, hj.sum_amt AS HASH_JOIN_금액합계,
+    CASE WHEN nl.cnt = hj.cnt AND nl.sum_amt = hj.sum_amt 
+         THEN 'PASS' ELSE 'FAIL' END AS 검증결과
+FROM nl_join nl, hash_join hj;
 
 SET AUTOTRACE OFF
 PROMPT
-PROMPT *** Case 03 NL JOIN → HASH JOIN 변경 실습 완료 ***
+PROMPT *** Case 03 NL → HASH JOIN 변경 실습 완료 ***
+PROMPT *** 다음: case_04.sql (JPPD 활용) ***
