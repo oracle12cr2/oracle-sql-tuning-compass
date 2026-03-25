@@ -1,0 +1,60 @@
+-- ============================================================
+-- Part 18 실습 06: ASH (Active Session History)
+-- V$SESSION(1초) → V$ACTIVE_SESSION_HISTORY(메모리) → DBA_HIST(디스크 1/10)
+-- ============================================================
+SET LINESIZE 200 PAGESIZE 100
+
+PROMPT ========================================
+PROMPT 1. 최근 5분 Top SQL (ASH)
+PROMPT ========================================
+COL EVENT FOR A40
+COL WAIT_CLASS FOR A15
+SELECT SQL_ID,
+       COUNT(*) AS SAMPLE_CNT,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER(), 2) AS PCT,
+       MAX(EVENT) AS TOP_EVENT,
+       MAX(WAIT_CLASS) AS TOP_WAIT_CLASS
+  FROM V$ACTIVE_SESSION_HISTORY
+ WHERE SAMPLE_TIME > SYSDATE - 5/1440
+   AND SQL_ID IS NOT NULL
+ GROUP BY SQL_ID
+ ORDER BY SAMPLE_CNT DESC
+ FETCH FIRST 10 ROWS ONLY;
+
+PROMPT ========================================
+PROMPT 2. 최근 10분 WAIT EVENT 분포
+PROMPT    ON CPU vs WAITING 비율 확인
+PROMPT ========================================
+SELECT NVL(EVENT, 'ON CPU') AS EVENT,
+       NVL(WAIT_CLASS, 'CPU') AS WAIT_CLASS,
+       COUNT(*) AS SAMPLE_CNT,
+       ROUND(COUNT(*) * 100 / SUM(COUNT(*)) OVER(), 2) AS PCT
+  FROM V$ACTIVE_SESSION_HISTORY
+ WHERE SAMPLE_TIME > SYSDATE - 10/1440
+ GROUP BY EVENT, WAIT_CLASS
+ ORDER BY SAMPLE_CNT DESC
+ FETCH FIRST 10 ROWS ONLY;
+
+PROMPT ========================================
+PROMPT 3. 1분 단위 Active Session Trend (최근 30분)
+PROMPT    급증 구간 = 부하 발생
+PROMPT ========================================
+SELECT TO_CHAR(TRUNC(SAMPLE_TIME, 'MI'), 'HH24:MI') AS MIN_TIME,
+       COUNT(*) AS ACTIVE_SESSIONS,
+       SUM(CASE WHEN SESSION_STATE = 'ON CPU' THEN 1 ELSE 0 END) AS ON_CPU,
+       SUM(CASE WHEN SESSION_STATE = 'WAITING' THEN 1 ELSE 0 END) AS WAITING
+  FROM V$ACTIVE_SESSION_HISTORY
+ WHERE SAMPLE_TIME > SYSDATE - 30/1440
+ GROUP BY TRUNC(SAMPLE_TIME, 'MI')
+ ORDER BY MIN_TIME;
+
+PROMPT ========================================
+PROMPT 4. Blocking Session 확인 (Lock 경합)
+PROMPT ========================================
+SELECT SESSION_ID, SQL_ID, EVENT, BLOCKING_SESSION,
+       TO_CHAR(SAMPLE_TIME, 'HH24:MI:SS') AS SAMPLE_TIME
+  FROM V$ACTIVE_SESSION_HISTORY
+ WHERE BLOCKING_SESSION IS NOT NULL
+   AND SAMPLE_TIME > SYSDATE - 10/1440
+ ORDER BY SAMPLE_TIME DESC
+ FETCH FIRST 20 ROWS ONLY;
